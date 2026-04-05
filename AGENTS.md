@@ -42,6 +42,8 @@ LeggedGym-Ex/
 
 ## CONVENTIONS
 
+**Language** always use english, translate non english stuff to english
+
 **Configuration Pattern**: Nested classes inheriting from `LeggedRobotCfg`/`LeggedRobotCfgPPO`. Example: `class GO2Cfg(LeggedRobotCfg)` with nested `class env`, `class rewards`, etc.
 
 **Task Registration**: Register in `legged_gym/envs/__init__.py`: `task_registry.register("go2", GO2, GO2Cfg, GO2CfgPPO)`

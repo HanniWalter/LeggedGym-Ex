@@ -57,6 +57,7 @@ runs
 *.egg-info
 __pycache__
 wandb
+wandb_key
 build
 *debug*
 resources/terrains/*.stl

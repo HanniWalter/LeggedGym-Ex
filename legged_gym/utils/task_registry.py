@@ -5,7 +5,7 @@ from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils.runner_registry import runner_registry
 
-from legged_gym import LEGGED_GYM_ROOT_DIR
+from legged_gym import PROJECT_ROOT_DIR
 from .helpers import get_args, update_cfg_from_args, class_to_dict, get_load_path, set_seed
 
 class TaskRegistry():
@@ -103,7 +103,7 @@ class TaskRegistry():
         _, train_cfg = update_cfg_from_args(None, train_cfg, args)
 
         if log_root=="default":
-            log_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
+            log_root = os.path.join(PROJECT_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
             log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
         elif log_root is None:
             log_dir = None

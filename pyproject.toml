@@ -3,7 +3,6 @@ name = "LeggedGym-Ex"
 version = "0.4.0"
 requires-python = ">=3.8"
 dependencies = [
-                'matplotlib',
                 'tensorboard',
                 'xlsxwriter',
                 'pandas',
@@ -25,7 +24,6 @@ isaacgym = [
     "numpy==1.24.1",
     "pandas==2.0.3",
     "scipy==1.10.1",
-    "matplotlib==3.7.5",
     "fsspec<=2025.3.0",  # fsspec==2025.3.1 has bug with python 3.8
     "isaacgym==1.0rc4",
     "onnx>=1.17.0",

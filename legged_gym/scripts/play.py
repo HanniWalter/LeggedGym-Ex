@@ -109,7 +109,6 @@ def interaction_loop(env, policy, args, task_type):
     logger = Logger(env.dt)
     robot_index = 0 # which robot is used for logging
     joint_index = 2 # which joint is used for logging
-    stop_state_log = 300 # number of steps before plotting states
     stop_rew_log = env.max_episode_length + 1 # number of steps before print average episode rewards
         
     # Get initial observations according to task type
@@ -130,7 +129,8 @@ def interaction_loop(env, policy, args, task_type):
     
     frame_dt = 1 / 60.0 # 30Hz
     # interaction loop
-    for i in range(10*int(env.max_episode_length)):
+    total_steps = 10 * int(env.max_episode_length)
+    for i in range(total_steps):
         
         t_start = time.perf_counter()
         # update commands from joystick
@@ -169,11 +169,20 @@ def interaction_loop(env, policy, args, task_type):
             actions = policy(obs_buf.detach())
             obs_buf, _, rews, dones, infos = env.step(actions.detach())
         
-        # print debug info
-        print_debug_info(env, robot_index)
+        # Show one-line progress instead of printing a line every step.
+        progress = (i + 1) / total_steps
+        bar_width = 32
+        filled = int(bar_width * progress)
+        bar = "=" * filled + "-" * (bar_width - filled)
+        dr_delay = env.simulator.dr_ctrl_delay[robot_index].item()
+        print(
+            f"\rPlay [{bar}] {i + 1}/{total_steps} | dr_ctrl_delay: {dr_delay:.2f}s",
+            end="",
+            flush=True,
+        )
         
         # Update logger info
-        if i < stop_state_log:
+        if i < 300:
             logger.log_states(
                 {
                     'dof_pos_target': actions[robot_index, joint_index].item() * env.cfg.control.action_scale,
@@ -191,8 +200,6 @@ def interaction_loop(env, policy, args, task_type):
                                                                           env.simulator.feet_indices, 2].cpu().numpy()
                 }
             )
-        elif i==stop_state_log:
-            logger.plot_states()
         if  0 < i < stop_rew_log:
             if infos["episode"]:
                 num_episodes = torch.sum(env.reset_buf).item()
@@ -206,6 +213,9 @@ def interaction_loop(env, policy, args, task_type):
         remaining = frame_dt - elapsed
         if remaining > 0:
             time.sleep(remaining)
+
+    # Finish progress line cleanly.
+    print()
 
 def export_policy(alg_runner, path: str, args, env_cfg, train_cfg, task_type):
     """export the policy as jit script according to different task types
@@ -264,8 +274,9 @@ def play(args):
     policy = ppo_runner.get_inference_policy(device=env.device)
     
     # export policy as a jit module (used to run it from C++ or python)
-    path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 
-                            train_cfg.runner.load_run, 'exported')
+    log_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
+    resume_path = get_load_path(log_root, load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
+    path = os.path.join(os.path.dirname(resume_path), 'exported')
     export_policy(ppo_runner, path, args, env_cfg, train_cfg, task_type)
 
     interaction_loop(env, policy, args, task_type)

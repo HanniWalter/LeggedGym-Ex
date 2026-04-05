@@ -1,9 +1,11 @@
 import os
 import sys
 
-LEGGED_GYM_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-print(f"LEGGED_GYM_ROOT_DIR: {LEGGED_GYM_ROOT_DIR}")
-LEGGED_GYM_ENVS_DIR = os.path.join(LEGGED_GYM_ROOT_DIR, 'legged_gym', 'envs')
+PROJECT_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+# Backward compatibility for existing imports.
+LEGGED_GYM_ROOT_DIR = PROJECT_ROOT_DIR
+print(f"PROJECT_ROOT_DIR: {PROJECT_ROOT_DIR}")
+LEGGED_GYM_ENVS_DIR = os.path.join(PROJECT_ROOT_DIR, 'legged_gym', 'envs')
 
 if sys.version_info[1] >= 10: # >=3.10 for genesis and isaacsim
     simulator_type = os.getenv("SIMULATOR")
