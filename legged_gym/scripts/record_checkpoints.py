@@ -307,6 +307,10 @@ class RecorderRuntime:
             target=np.asarray(self.args.camera_lookat, dtype=np.float32),
             env_index=0,
         )
+        # Warmup: reset and capture a throwaway frame to prime the IsaacGym
+        # rendering pipeline before the first real recording.
+        env.reset()
+        env.simulator.capture_recording_frame()
         self.env = env
         self.runner = runner
 
@@ -365,14 +369,25 @@ def record_video(runtime: RecorderRuntime, checkpoint_info: dict):
     runtime.runner.load(str(checkpoint_info["checkpoint_path"]), load_optimizer=False)
     runtime.policy = runtime.runner.get_inference_policy(device=runtime.env.device)
     runtime.env.reset()
+    
+    # Warmup: flush any stale frame from the previous recording by stepping
+    # graphics and discarding the first captured frame before we start encoding.
+    runtime.env.simulator.capture_recording_frame()
+    
     state = initialize_observation_state(runtime.env, runtime.task_type)
 
     final_video_path = checkpoint_info["video_path"]
     temp_video_path = final_video_path.with_suffix(".tmp.mp4")
+    
+    # Ensure directory exists before writing video
+    final_video_path.parent.mkdir(parents=True, exist_ok=True)
+    
     if temp_video_path.exists():
         temp_video_path.unlink()
 
+    # Try ffmpeg first for better reliability
     ffmpeg_path = shutil.which("ffmpeg")
+    use_ffmpeg = False
     if ffmpeg_path is not None:
         ffmpeg_cmd = [
             ffmpeg_path,
@@ -390,54 +405,141 @@ def record_video(runtime: RecorderRuntime, checkpoint_info: dict):
             "-an",
             "-c:v",
             "libx264",
+            "-preset",
+            "ultrafast",
+            "-profile:v",
+            "baseline",
+            "-level",
+            "3.0",
             "-pix_fmt",
             "yuv420p",
-            "-movflags",
-            "+faststart",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-color_range",
+            "tv",
             str(temp_video_path),
         ]
-        ffmpeg_proc = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
         try:
-            for _ in range(runtime.args.num_steps):
-                state, _, _, _ = step_task(runtime.env, runtime.policy, runtime.task_type, state)
-                frame = runtime.env.simulator.capture_recording_frame()
-                frame = np.ascontiguousarray(frame)
-                ffmpeg_proc.stdin.write(frame.tobytes())
-        except BrokenPipeError:
-            ffmpeg_proc.kill()
-            ffmpeg_proc.wait()
-            stderr_text = ffmpeg_proc.stderr.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"ffmpeg pipe broke while encoding video: {stderr_text[-2000:]}")
+            ffmpeg_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            frame_count = 0
+            try:
+                for _ in range(runtime.args.num_steps):
+                    state, _, _, _ = step_task(runtime.env, runtime.policy, runtime.task_type, state)
+                    frame = runtime.env.simulator.capture_recording_frame()
+                    frame = np.ascontiguousarray(frame)
+                    ffmpeg_proc.stdin.write(frame.tobytes())
+                    frame_count += 1
+            except BrokenPipeError:
+                ffmpeg_proc.kill()
+                ffmpeg_proc.wait()
+                stderr_text = ffmpeg_proc.stderr.read().decode("utf-8", errors="ignore")
+                raise RuntimeError(f"ffmpeg pipe broke after {frame_count} frames: {stderr_text[-1000:]}")
 
-        ffmpeg_proc.stdin.close()
-        ffmpeg_proc.wait()
-        ffmpeg_stderr = ffmpeg_proc.stderr.read()
-        if ffmpeg_proc.returncode != 0:
-            stderr_text = ffmpeg_stderr.decode("utf-8", errors="ignore")
-            raise RuntimeError(f"ffmpeg failed to encode video: {stderr_text[-2000:]}")
-    else:
-        writer = cv2.VideoWriter(
-            str(temp_video_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            runtime.args.fps,
-            (runtime.args.camera_width, runtime.args.camera_height),
-        )
-        if not writer.isOpened():
-            raise RuntimeError(f"Failed to open video writer for {temp_video_path}")
+            # communicate() closes stdin, reads stdout/stderr, and waits for process
+            ffmpeg_stdout, ffmpeg_stderr = ffmpeg_proc.communicate(timeout=120)
+            ffmpeg_returncode = ffmpeg_proc.returncode
+            
+            if ffmpeg_returncode is None:
+                ffmpeg_proc.kill()
+                raise RuntimeError(f"ffmpeg process still running after communicate timeout, killed it")
+            
+            if ffmpeg_returncode != 0:
+                stderr_text = ffmpeg_stderr.decode("utf-8", errors="ignore") if ffmpeg_stderr else "no stderr"
+                raise RuntimeError(f"ffmpeg failed (exit {ffmpeg_returncode}, {frame_count} frames): {stderr_text[-1000:]}")
+            
+            # Verify temp file was created and has content
+            if not temp_video_path.exists():
+                raise RuntimeError(f"ffmpeg succeeded (exit 0) but output file missing at {temp_video_path}")
+            
+            file_size = temp_video_path.stat().st_size
+            if file_size == 0:
+                raise RuntimeError(f"ffmpeg created empty output file at {temp_video_path} ({frame_count} frames encoded)")
+            
+            use_ffmpeg = True
+        except Exception as ffmpeg_error:
+            # Clean up failed attempt
+            if temp_video_path.exists():
+                temp_video_path.unlink()
+            raise ffmpeg_error
+    
+    # Fallback to OpenCV if ffmpeg unavailable or failed
+    if not use_ffmpeg:
+        # Try different codecs with OpenCV
+        codecs = [
+            ("mp4v", "w"),  # Preferred: MPEG-4
+            ("H264", "r"),  # H.264 backup
+            ("MJPG", "b"),  # Motion JPEG fallback
+        ]
+        
+        video_written_successfully = False
+        last_cv2_error = None
+        
+        for codec_name, _ in codecs:
+            if video_written_successfully:
+                break
+            
+            if temp_video_path.exists():
+                temp_video_path.unlink()
+            
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec_name)
+                writer = cv2.VideoWriter(
+                    str(temp_video_path),
+                    fourcc,
+                    runtime.args.fps,
+                    (runtime.args.camera_width, runtime.args.camera_height),
+                )
+                
+                if not writer.isOpened():
+                    last_cv2_error = f"VideoWriter failed to open with codec {codec_name}"
+                    continue
+                
+                frames_written = 0
+                try:
+                    for _ in range(runtime.args.num_steps):
+                        state, _, _, _ = step_task(runtime.env, runtime.policy, runtime.task_type, state)
+                        frame = runtime.env.simulator.capture_recording_frame()
+                        success = writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                        if not success:
+                            raise RuntimeError(f"VideoWriter.write() failed at frame {frames_written}")
+                        frames_written += 1
+                finally:
+                    writer.release()
+                
+                # Verify file was created with content
+                if not temp_video_path.exists():
+                    last_cv2_error = f"cv2.VideoWriter ({codec_name}) did not create output file ({frames_written} frames)"
+                    continue
+                
+                file_size = temp_video_path.stat().st_size
+                if file_size == 0:
+                    last_cv2_error = f"cv2.VideoWriter ({codec_name}) created empty file ({frames_written} frames)"
+                    continue
+                
+                video_written_successfully = True
+            except Exception as e:
+                last_cv2_error = str(e)
+                continue
+        
+        if not video_written_successfully:
+            error_msg = f"All video encoding attempts failed. Last error: {last_cv2_error}"
+            if temp_video_path.exists():
+                temp_video_path.unlink()
+            raise RuntimeError(error_msg)
 
-        try:
-            for _ in range(runtime.args.num_steps):
-                state, _, _, _ = step_task(runtime.env, runtime.policy, runtime.task_type, state)
-                frame = runtime.env.simulator.capture_recording_frame()
-                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        finally:
-            writer.release()
-
+    # Final safety check before rename
+    if not temp_video_path.exists():
+        raise RuntimeError(f"Video encoding failed: temp file not found at {temp_video_path}")
+    
     os.replace(temp_video_path, final_video_path)
     return final_video_path
 
@@ -552,7 +654,20 @@ def process_checkpoint(runtime: RecorderRuntime, status_store: StatusStore, logg
                 if runtime.args.fail_fast:
                     raise
                 return
-            time.sleep(runtime.args.retry_backoff * (2 ** (attempt - 1)))
+            
+            # Log retry attempt with backoff time
+            backoff_time = runtime.args.retry_backoff * (2 ** (attempt - 1))
+            logger.event(
+                "checkpoint_retry",
+                level="INFO",
+                message=f"Retrying checkpoint {checkpoint_info['iteration']} in {backoff_time:.1f}s (attempt {attempt + 1}/{runtime.args.max_retries})",
+                checkpoint_path=str(checkpoint_info["checkpoint_path"]),
+                iteration=checkpoint_info["iteration"],
+                attempt=attempt,
+                next_attempt=attempt + 1,
+                backoff_seconds=backoff_time,
+            )
+            time.sleep(backoff_time)
 
 
 def main():
@@ -632,10 +747,16 @@ def main():
 
                     status = (run_status_store.get(key) or {}).get("status")
                     if status == "recorded":
-                        continue
-                    if status == "recording":
-                        continue
-                    if status == "failed":
+                        # Skip if the video file actually exists; requeue if it was deleted
+                        if final_video_path := Path((run_status_store.get(key) or {}).get("video_path", "")):
+                            if final_video_path.exists():
+                                continue
+                        # Video file missing despite "recorded" status — requeue
+                        run_status_store.update(key, status="pending")
+                    elif status == "recording":
+                        # Stale "recording" status from a previously interrupted session — reset to pending
+                        run_status_store.update(key, status="pending")
+                    elif status == "failed":
                         continue
                     process_checkpoint(runtime, run_status_store, logger, checkpoint_info)
 

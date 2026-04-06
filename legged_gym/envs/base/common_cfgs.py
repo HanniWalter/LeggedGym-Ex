@@ -316,10 +316,11 @@ class K1FlatCommonCfg(LeggedRobotCfg):
 
     class asset(LeggedRobotCfg.asset):
         name = "k1"
-        file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/booster_robotics/K1/K1_22dof.urdf'
+        file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/booster_robotics/K1/K1_22dof_slim.urdf'
         xml_file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/booster_robotics/K1/K1_22dof.xml'
+        flip_visual_attachments = False
         foot_name = "foot"
-        penalize_contacts_on = ["Trunk", "Shank", "Hip", "Arm", "Head"]
+        penalize_contacts_on = []  # DISABLED: No contact checking
         terminate_after_contacts_on = []
         key_bodies = ["Head_2",
                       "left_hand_link", "right_hand_link",

@@ -33,6 +33,8 @@ from __future__ import annotations
 import time
 import os
 import json
+import shutil
+import subprocess
 from collections import deque
 import statistics
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -254,6 +256,75 @@ class OnPolicyRunner:
 
     _VIDEO_RE = re.compile(r"video_(\d+)\.mp4$")
 
+    def _video_upload_stage_dir(self) -> Optional[str]:
+        if self.log_dir is None:
+            return None
+        stage_dir = os.path.join(self.log_dir, "wandb_video_staging")
+        os.makedirs(stage_dir, exist_ok=True)
+        return stage_dir
+
+    def _probe_video_file(self, path: str) -> bool:
+        ffprobe_path = shutil.which("ffprobe")
+        if ffprobe_path is None:
+            return os.path.isfile(path) and os.path.getsize(path) > 1024
+        result = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,nb_frames,width,height",
+                "-of",
+                "default=noprint_wrappers=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
+    def _wait_for_stable_video_file(self, path: str, timeout_s: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout_s
+        last_size = -1
+        stable_reads = 0
+        while time.monotonic() < deadline:
+            if not os.path.isfile(path):
+                time.sleep(0.2)
+                continue
+            current_size = os.path.getsize(path)
+            if current_size > 0 and current_size == last_size:
+                stable_reads += 1
+            else:
+                stable_reads = 0
+            last_size = current_size
+            if stable_reads >= 2 and self._probe_video_file(path):
+                return True
+            time.sleep(0.2)
+        return False
+
+    def _prepare_video_for_wandb(self, src_path: str, iteration: int, current_it: int) -> str:
+        if not self._wait_for_stable_video_file(src_path):
+            raise RuntimeError(f"source video is not stable/valid yet: {src_path}")
+
+        stage_dir = self._video_upload_stage_dir()
+        if stage_dir is None:
+            raise RuntimeError("log_dir is not set; cannot stage video for wandb upload")
+
+        staged_path = os.path.join(stage_dir, f"checkpoint_{iteration}_iter_{current_it}.mp4")
+        tmp_staged_path = staged_path + ".tmp"
+
+        # Copy the source file to a stable staging location.
+        # This avoids race conditions where wandb reads a file still being written.
+        shutil.copyfile(src_path, tmp_staged_path)
+        os.replace(tmp_staged_path, staged_path)
+
+        if not self._probe_video_file(staged_path):
+            raise RuntimeError(f"staged wandb video is not valid: {staged_path}")
+
+        return staged_path
+
     def _check_and_upload_videos(self, current_it: int) -> None:
         if self.log_dir is None:
             return
@@ -278,9 +349,10 @@ class OnPolicyRunner:
                     print(f"[video-upload] skipping upload (sync_wandb=False)")
                     continue
                 try:
+                    staged_path = self._prepare_video_for_wandb(entry.path, iteration, current_it)
                     video_payload = {
                         "Video/checkpoint_video": wandb.Video(
-                            entry.path,
+                            staged_path,
                             format="mp4",
                             caption=f"checkpoint {iteration} recorded at iteration {current_it}",
                         )
@@ -294,7 +366,8 @@ class OnPolicyRunner:
                         f"[video-upload] uploaded video for checkpoint {iteration} at training iteration {current_it}"
                     )
                 except Exception as exc:
-                    print(f"[video-upload] ERROR uploading checkpoint {iteration}: {exc}")
+                    self._uploaded_video_iters.add(iteration)
+                    print(f"[video-upload] ERROR uploading checkpoint {iteration} (will not retry): {exc}")
 
     def log(
         self,
