@@ -124,11 +124,14 @@ class DreamWaQRunner(OnPolicyRunner):
             if self.log_dir is not None:
                 self.log(locals())
             if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+                ckpt_dir = os.path.join(self.log_dir, 'checkpoints', f'model_{it}')
+                self.save(os.path.join(ckpt_dir, f'model_{it}.pt'))
             ep_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations
-        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+        final_iter = self.current_learning_iteration
+        ckpt_dir = os.path.join(self.log_dir, 'checkpoints', f'model_{final_iter}')
+        self.save(os.path.join(ckpt_dir, f'model_{final_iter}.pt'))
 
     def log(self, locs, width=80, pad=35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -204,4 +207,6 @@ class DreamWaQRunner(OnPolicyRunner):
                        f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
                        f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
                                locs['num_learning_iterations'] - locs['it']):.1f}s\n""")
+        log_string += f"""{'Videos recorded:':>{pad}} {len(self._uploaded_video_iters)}\n"""
         print(log_string)
+        self._check_and_upload_videos(locs['it'])

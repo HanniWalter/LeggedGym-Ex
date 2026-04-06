@@ -1,6 +1,7 @@
 from legged_gym import *
 from legged_gym.simulator.simulator import Simulator
 from PIL import Image as im
+import sys
 import torch
 import numpy as np
 import os
@@ -19,13 +20,15 @@ import warnings
 class IsaacGymSimulator(Simulator):
     def __init__(self, cfg : LeggedRobotCfg, sim_params: dict, sim_device: str = "cuda:0", headless: bool = False):
         self._gym = gymapi.acquire_gym()
+        self._offscreen_render = bool(headless and getattr(cfg.viewer, "offscreen_render", False))
+        self._recording_camera = None
         # Convert dict sim_params to gymapi.SimParams
         self._sim_params = gymapi.SimParams()
         gymutil.parse_sim_config(sim_params, self._sim_params)
         _, self._sim_device_id = gymutil.parse_device_str(sim_device)
         # graphics device for rendering, -1 for no rendering
         self.graphics_device_id = self._sim_device_id
-        if headless == True:
+        if headless == True and not self._offscreen_render:
             self.graphics_device_id = -1
         self.physics_engine = gymapi.SIM_PHYSX
         super().__init__(cfg, sim_params, sim_device, headless)
@@ -210,6 +213,58 @@ class IsaacGymSimulator(Simulator):
         cam_pos = gymapi.Vec3(eye[0], eye[1], eye[2])
         cam_target = gymapi.Vec3(target[0], target[1], target[2])
         self._gym.viewer_camera_look_at(self._viewer, None, cam_pos, cam_target)
+
+    def create_recording_camera(
+        self,
+        width: int,
+        height: int,
+        position: np.ndarray,
+        target: np.ndarray,
+        horizontal_fov_deg: float = None,
+        env_index: int = 0,
+    ):
+        if self.graphics_device_id < 0:
+            raise RuntimeError("Offscreen rendering is disabled. Set cfg.viewer.offscreen_render = True.")
+
+        camera_props = gymapi.CameraProperties()
+        camera_props.width = width
+        camera_props.height = height
+        if horizontal_fov_deg is not None:
+            camera_props.horizontal_fov = horizontal_fov_deg
+
+        camera_handle = self._gym.create_camera_sensor(self._envs[env_index], camera_props)
+        camera_pos = gymapi.Vec3(position[0], position[1], position[2])
+        camera_target = gymapi.Vec3(target[0], target[1], target[2])
+        self._gym.set_camera_location(camera_handle, self._envs[env_index], camera_pos, camera_target)
+        self._recording_camera = {
+            "handle": camera_handle,
+            "width": width,
+            "height": height,
+            "env_index": env_index,
+        }
+        return camera_handle
+
+    def capture_recording_frame(self) -> np.ndarray:
+        if self._recording_camera is None:
+            raise RuntimeError("Recording camera is not initialized.")
+
+        if self._device != "cpu":
+            self._gym.fetch_results(self._sim, True)
+        self._gym.step_graphics(self._sim)
+        self._gym.render_all_camera_sensors(self._sim)
+
+        raw_image = self._gym.get_camera_image(
+            self._sim,
+            self._envs[self._recording_camera["env_index"]],
+            self._recording_camera["handle"],
+            gymapi.IMAGE_COLOR,
+        )
+        frame_rgba = np.asarray(raw_image, dtype=np.uint8).reshape(
+            self._recording_camera["height"],
+            self._recording_camera["width"],
+            4,
+        )
+        return frame_rgba[:, :, :3].copy()
     
     def update_sensors(self):
         """ Update depth images from the depth camera sensors
@@ -303,6 +358,7 @@ class IsaacGymSimulator(Simulator):
         asset_path = self._cfg.asset.file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
         asset_root = os.path.dirname(asset_path)
         asset_file = os.path.basename(asset_path)
+        print(f"Loading robot URDF: {asset_file}")
 
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = self._cfg.asset.default_dof_drive_mode

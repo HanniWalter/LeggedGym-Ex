@@ -102,13 +102,17 @@ class TaskRegistry():
         # override cfg from args (if specified)
         _, train_cfg = update_cfg_from_args(None, train_cfg, args)
 
+        run_timestamp = getattr(args, "run_timestamp", None)
+        if run_timestamp is None:
+            run_timestamp = datetime.now().strftime('%b%d_%H-%M-%S')
+
         if log_root=="default":
             log_root = os.path.join(PROJECT_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
-            log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
+            log_dir = os.path.join(log_root, run_timestamp + '_' + train_cfg.runner.run_name)
         elif log_root is None:
             log_dir = None
         else:
-            log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
+            log_dir = os.path.join(log_root, run_timestamp + '_' + train_cfg.runner.run_name)
         
         train_cfg_dict = class_to_dict(train_cfg)
         sim_device = "cpu" if args.cpu else "cuda"

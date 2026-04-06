@@ -251,6 +251,7 @@ class LeggedRobotCfg(BaseConfig):
         ref_env: int = 0
         pos: List[float] = [2.0, 2.0, 1.0]       # [m], relative to the robot position
         lookat: List[float] = [0.0, 0.0, 0.0]  # [m], relative to the robot position
+        offscreen_render: bool = False
         rendered_envs_idx: List[int] = [i for i in range(5)]  # [Genesis] number of environments to be rendered, if not headless
     
     # sensor configuration:

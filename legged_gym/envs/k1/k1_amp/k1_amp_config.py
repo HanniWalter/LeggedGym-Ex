@@ -45,17 +45,17 @@ class K1AMPCfg(K1FlatCommonCfg):
             orientation = -2.0
             dof_acc = -2.5e-7
             dof_power = -1.e-4
-            collision = -1.0
+            collision = 0.0  # DISABLED: No contact penalties
             action_rate = -0.01
             action_smoothness = -0.01
             # regularization
             feet_distance = -100.0
             hip_yaw_roll_pos = -0.2
             arm_pos = -0.01
-            feet_slip = -0.5
+            feet_slip = 0.0  # DISABLED: No slip penalties
             foot_clearance = 0.5
             foot_flat = 0.2
-            foot_landing_vel = -0.15
+            foot_landing_vel = 0.0  # DISABLED: No landing velocity penalties
             biped_periodic_gait = 1.0
             feet_contact_stand_still = 0.5
             dof_close_to_default_stand_still = -0.5

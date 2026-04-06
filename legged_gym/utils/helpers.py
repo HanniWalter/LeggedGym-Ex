@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import random
 import argparse
+import re
 
 def class_to_dict(obj) -> dict:
     if not hasattr(obj,"__dict__"):
@@ -57,15 +58,49 @@ def get_load_path(root, load_run=-1, checkpoint=-1):
     else:
         load_run = os.path.join(root, load_run)
 
-    if checkpoint==-1:
-        models = [file for file in os.listdir(load_run) if 'model' in file]
-        models.sort(key=lambda m: '{0:0>15}'.format(m))
-        model = models[-1]
-    else:
-        model = "model_{}.pt".format(checkpoint) 
+    # Prefer new layout: <run>/checkpoints/model_<iter>/model_<iter>.pt
+    # Fall back to legacy flat layout: <run>/model_<iter>.pt
+    if checkpoint != -1:
+        nested_model = os.path.join(
+            load_run,
+            'checkpoints',
+            f'model_{checkpoint}',
+            f'model_{checkpoint}.pt',
+        )
+        if os.path.isfile(nested_model):
+            return nested_model
 
-    load_path = os.path.join(load_run, model)
-    return load_path
+        flat_model = os.path.join(load_run, f"model_{checkpoint}.pt")
+        if os.path.isfile(flat_model):
+            return flat_model
+
+        raise ValueError(f"Checkpoint model_{checkpoint}.pt not found in run: {load_run}")
+
+    candidates = []
+
+    flat_model_re = re.compile(r"^model_(\d+)\.pt$")
+    for name in os.listdir(load_run):
+        match = flat_model_re.match(name)
+        if match:
+            candidates.append((int(match.group(1)), os.path.join(load_run, name)))
+
+    checkpoints_dir = os.path.join(load_run, 'checkpoints')
+    nested_dir_re = re.compile(r"^model_(\d+)$")
+    if os.path.isdir(checkpoints_dir):
+        for dirname in os.listdir(checkpoints_dir):
+            match = nested_dir_re.match(dirname)
+            if not match:
+                continue
+            iter_id = int(match.group(1))
+            model_path = os.path.join(checkpoints_dir, dirname, f"model_{iter_id}.pt")
+            if os.path.isfile(model_path):
+                candidates.append((iter_id, model_path))
+
+    if not candidates:
+        raise ValueError("No checkpoints found in run: " + load_run)
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
 
 def update_cfg_from_args(env_cfg, cfg_train, args):
     """Override some configuration parameters from command line arguments
@@ -95,6 +130,10 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
         # alg runner parameters
         if args.max_iterations is not None:
             cfg_train.runner.max_iterations = args.max_iterations
+        if args.experiment_name is not None:
+            cfg_train.runner.experiment_name = args.experiment_name
+        if args.run_name is not None:
+            cfg_train.runner.run_name = args.run_name
         if args.resume:
             cfg_train.runner.resume = args.resume
         if args.sync_wandb:
@@ -122,6 +161,9 @@ def get_args():
     parser.add_argument('--cpu',            action='store_true', default=False, help="use CPU instead of CUDA")
     parser.add_argument('--num_envs',       type=int, default=None, help="number of parallel environments")
     parser.add_argument('--max_iterations', type=int, default=None, help="max number of training iterations")
+    parser.add_argument('--experiment_name', type=str, default=None, help="override experiment name used for log directory")
+    parser.add_argument('--run_name',       type=str, default=None, help="override run name used for log directory")
+    parser.add_argument('--run_timestamp',  type=str, default=None, help="override run timestamp used for log directory naming")
     parser.add_argument('--resume',         action='store_true', default=False, help="resume training from specified checkpoint")
     parser.add_argument('--sync_wandb',     action='store_true', default=False, help="synchronize training log with wandb")
     parser.add_argument('--export_onnx',    action='store_true', default=False, help="export policy as onnx (besides jit)")

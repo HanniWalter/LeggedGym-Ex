@@ -288,8 +288,10 @@ class IsaacLabSimulator(Simulator):
                                                        max_angular_velocity=self._cfg.asset.max_angular_velocity)
         
         # Use urdf file to keep consistent with other simulators
+        urdf_path = self._cfg.asset.file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
+        print(f"Loading robot URDF: {os.path.basename(urdf_path)}")
         urdf_cfg = sim_utils.UrdfFileCfg(
-            asset_path=self._cfg.asset.file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR),
+            asset_path=urdf_path,
             fix_base=self._cfg.asset.fix_base_link,
             merge_fixed_joints=self._cfg.asset.collapse_fixed_joints,
             replace_cylinders_with_capsules=self._cfg.asset.replace_cylinder_with_capsule,

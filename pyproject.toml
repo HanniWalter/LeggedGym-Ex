@@ -13,6 +13,7 @@ dependencies = [
                 'torchvision',
                 'numpy',
                 'pygame',
+                'opencv-python',
                 'trimesh',
                 'warp-lang'
 ]

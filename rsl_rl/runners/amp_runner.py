@@ -32,6 +32,10 @@ class AMPRunner(OnPolicyRunner):
     ) -> None:
         super().__init__(env, train_cfg, log_dir, device)
 
+    def _pre_learn(self, init_at_random_ep_len: bool) -> None:
+        self._wandb_sync_tensorboard = False
+        super()._pre_learn(init_at_random_ep_len)
+
 
     def _init_agent_and_algo(self) -> None:
         """Initialize the AMP actor-critic and PPO_AMP algorithm."""
@@ -163,12 +167,15 @@ class AMPRunner(OnPolicyRunner):
                 self.log(locals())
             if it % self.save_interval == 0:
                 assert self.log_dir is not None
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+                ckpt_dir = os.path.join(self.log_dir, 'checkpoints', f'model_{it}')
+                self.save(os.path.join(ckpt_dir, f'model_{it}.pt'))
             ep_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations
         assert self.log_dir is not None
-        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+        final_iter = self.current_learning_iteration
+        ckpt_dir = os.path.join(self.log_dir, 'checkpoints', f'model_{final_iter}')
+        self.save(os.path.join(ckpt_dir, f'model_{final_iter}.pt'))
 
 
     def log(
@@ -191,6 +198,7 @@ class AMPRunner(OnPolicyRunner):
         iteration_time = locs['collection_time'] + locs['learn_time']
 
         ep_string = f''
+        wandb_scalars: Dict[str, Any] = {}
         if locs['ep_infos']:
             for key in locs['ep_infos'][0]:
                 infotensor = torch.tensor([], device=self.device)
@@ -203,6 +211,7 @@ class AMPRunner(OnPolicyRunner):
                     infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
                 value = torch.mean(infotensor)
                 self.writer.add_scalar('Episode/' + key, value, locs['it'])
+                wandb_scalars['Episode/' + key] = value.item()
                 ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""   
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
@@ -220,11 +229,28 @@ class AMPRunner(OnPolicyRunner):
         self.writer.add_scalar('Perf/total_fps', fps, locs['it'])
         self.writer.add_scalar('Perf/collection time', locs['collection_time'], locs['it'])
         self.writer.add_scalar('Perf/learning_time', locs['learn_time'], locs['it'])
+        wandb_scalars['Loss/value_function'] = float(locs['mean_value_loss'])
+        wandb_scalars['Loss/surrogate'] = float(locs['mean_surrogate_loss'])
+        wandb_scalars['Loss/AMP'] = float(locs['mean_amp_loss'])
+        wandb_scalars['Loss/AMP_grad'] = float(locs['mean_grad_pen_loss'])
+        wandb_scalars['AMP/policy_pred'] = float(locs['mean_policy_pred'])
+        wandb_scalars['AMP/expert_pred'] = float(locs['mean_expert_pred'])
+        if locs['mean_symmetry_loss'] is not None:
+            wandb_scalars['Loss/symmetry_loss'] = float(locs['mean_symmetry_loss'])
+        wandb_scalars['Loss/learning_rate'] = float(self.alg.learning_rate)
+        wandb_scalars['Policy/mean_noise_std'] = mean_std.item()
+        wandb_scalars['Perf/total_fps'] = float(fps)
+        wandb_scalars['Perf/collection time'] = float(locs['collection_time'])
+        wandb_scalars['Perf/learning_time'] = float(locs['learn_time'])
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_reward/time', statistics.mean(locs['rewbuffer']), self.tot_time)
             self.writer.add_scalar('Train/mean_episode_length/time', statistics.mean(locs['lenbuffer']), self.tot_time)
+            wandb_scalars['Train/mean_reward'] = float(statistics.mean(locs['rewbuffer']))
+            wandb_scalars['Train/mean_episode_length'] = float(statistics.mean(locs['lenbuffer']))
+            wandb_scalars['Train/mean_reward/time'] = float(statistics.mean(locs['rewbuffer']))
+            wandb_scalars['Train/mean_episode_length/time'] = float(statistics.mean(locs['lenbuffer']))
 
         str_iter = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
 
@@ -259,7 +285,13 @@ class AMPRunner(OnPolicyRunner):
                        f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
                        f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
                                locs['num_learning_iterations'] - locs['it']):.1f}s\n""")
+        log_string += f"""{'Videos recorded:':>{pad}} {len(self._uploaded_video_iters)}\n"""
+        wandb_scalars['train/total_timesteps'] = float(self.tot_timesteps)
+        wandb_scalars['train/iteration_time'] = float(iteration_time)
+        wandb_scalars['train/total_time'] = float(self.tot_time)
         print(log_string)
+        self._wandb_log_scalars(locs['it'], wandb_scalars)
+        self._check_and_upload_videos(locs['it'])
 
     def save(
         self,
@@ -272,6 +304,7 @@ class AMPRunner(OnPolicyRunner):
             path: File path to save the checkpoint.
             infos: Optional additional information to save with the checkpoint.
         """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save({
             'model_state_dict': self.alg.actor_critic.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
