@@ -208,6 +208,60 @@ class OnPolicyRunner:
         final_iter = self.current_learning_iteration
         ckpt_dir = os.path.join(self.log_dir, 'checkpoints', f'model_{final_iter}')
         self.save(os.path.join(ckpt_dir, f'model_{final_iter}.pt'))
+        self._wait_and_upload_final_video(final_iter)
+
+    def _wait_and_upload_final_video(self, final_iter: int, timeout_s: float = 120.0) -> None:
+        """Wait up to *timeout_s* for the recorder to produce the final checkpoint
+        video, then upload it to wandb.  Called once at the very end of training
+        so the last checkpoint video is not missed.
+        """
+        if self.log_dir is None:
+            return
+        if final_iter in self._uploaded_video_iters:
+            return  # already handled inside the loop (edge case)
+
+        video_path = os.path.join(
+            self.log_dir, 'checkpoints', f'model_{final_iter}', f'video_{final_iter}.mp4'
+        )
+        print(
+            f"[video-upload] waiting up to {timeout_s:.0f}s for final checkpoint "
+            f"video (iteration {final_iter}) …"
+        )
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if os.path.isfile(video_path) and self._probe_video_file(video_path):
+                break
+            time.sleep(2.0)
+        else:
+            print(
+                f"[video-upload] timed out waiting for final checkpoint video "
+                f"at {video_path} — skipping upload"
+            )
+            return
+
+        print(f"[video-upload] final checkpoint video is ready: {video_path}")
+        if not self.sync_wandb:
+            self._uploaded_video_iters.add(final_iter)
+            print("[video-upload] skipping upload (sync_wandb=False)")
+            return
+        try:
+            staged_path = self._prepare_video_for_wandb(video_path, final_iter, final_iter)
+            video_payload = {
+                "Video/checkpoint_video": wandb.Video(
+                    staged_path,
+                    format="mp4",
+                    caption=f"checkpoint {final_iter} recorded at iteration {final_iter}",
+                )
+            }
+            if self._wandb_sync_tensorboard:
+                wandb.log(video_payload)
+            else:
+                wandb.log(video_payload, step=final_iter)
+            self._uploaded_video_iters.add(final_iter)
+            print(f"[video-upload] uploaded final checkpoint video (iteration {final_iter})")
+        except Exception as exc:
+            self._uploaded_video_iters.add(final_iter)
+            print(f"[video-upload] ERROR uploading final checkpoint video: {exc}")
 
     def _pre_learn(self, init_at_random_ep_len: bool) -> None:
         """Prepare for training by initializing logging and episode buffers.
