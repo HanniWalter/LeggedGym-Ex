@@ -24,6 +24,19 @@ if not hasattr(np, '_core'):
     sys.modules.setdefault("numpy._core.multiarray", _np_core.multiarray)
     del _np_core, _attr, _mod_name, _submod
 
+
+def print_progress(prefix, current, total, t_start, force_newline=False):
+    """Print a compact progress line with percentage and ETA."""
+    current = min(current, total)
+    ratio = 1.0 if total == 0 else current / total
+    elapsed = time.perf_counter() - t_start
+    eta = (elapsed / max(current, 1)) * max(total - current, 0)
+    msg = (
+        f"{prefix}: {current}/{total} "
+        f"({ratio * 100:5.1f}%) | elapsed {elapsed:6.1f}s | ETA {eta:6.1f}s"
+    )
+    print(msg, end="\n" if force_newline else "\r", flush=True)
+
 def process_single_motion_file(env, motion_file_path, output_dir):
     """Process a single motion file and save the processed data.
     
@@ -58,7 +71,8 @@ def process_single_motion_file(env, motion_file_path, output_dir):
     root_rot = torch.from_numpy(root_rot).to(env.device).float()
     root_lin_vel = torch.zeros_like(root_pos)
     root_lin_vel[:-1] = (root_pos[1:] - root_pos[:-1]) * aligned_fps
-    root_lin_vel[-1] = root_lin_vel[-2]  # set the last velocity to be the same as the second last one
+    if root_lin_vel.shape[0] > 1:
+        root_lin_vel[-1] = root_lin_vel[-2]  # set the last velocity to be the same as the second last one
     root_ang_vel = torch.zeros_like(root_pos)
     root_euler = get_euler_xyz(root_rot)
     # compute angular velocity from quaternion delta to avoid Euler singularities/wrapping
@@ -71,32 +85,38 @@ def process_single_motion_file(env, motion_file_path, output_dir):
     angle = 2.0 * torch.atan2(sin_half_angle, delta_w)
     axis = delta_xyz / sin_half_angle.unsqueeze(-1).clamp(min=1e-8)
     root_ang_vel[:-1] = axis * angle.unsqueeze(-1) * aligned_fps
-    root_ang_vel[-1] = root_ang_vel[-2]  # set the last velocity to be the same as the second last one
+    if root_ang_vel.shape[0] > 1:
+        root_ang_vel[-1] = root_ang_vel[-2]  # set the last velocity to be the same as the second last one
     dof_pos = torch.from_numpy(dof_pos).to(env.device).float()
     dof_vel = torch.zeros_like(dof_pos)
     dof_vel[:-1] = (dof_pos[1:] - dof_pos[:-1]) * aligned_fps
-    dof_vel[-1] = dof_vel[-2]  # set the last velocity to be the same as the second last one
+    if dof_vel.shape[0] > 1:
+        dof_vel[-1] = dof_vel[-2]  # set the last velocity to be the same as the second last one
     all_indices = torch.arange(env.num_envs, device=env.device)
     
     num_frames = root_pos.shape[0]
-    frame_dt = 1.0 / aligned_fps   # target wall-clock seconds per frame
-    print(f"Playing {num_frames} frames at {aligned_fps} fps (frame_dt={frame_dt*1000:.1f} ms)")
+    worker_envs = min(env.num_envs, num_frames)
+    print(
+        f"Processing {num_frames} frames at {aligned_fps} fps "
+        f"using {worker_envs} parallel env workers"
+    )
 
-    frame = 0
     key_body_pos_relative_to_base_list = []
-    for i in range(num_frames):
-        t_start = time.perf_counter()
+    frame_counter = 0
+    loop_start = time.perf_counter()
+    for start_idx in range(0, num_frames, worker_envs):
+        end_idx = min(start_idx + worker_envs, num_frames)
+        batch_size = end_idx - start_idx
+        batch_indices = all_indices[:batch_size]
 
-        print(f"Loop frame {frame} / {num_frames}", end="\r")
-        cur = i
-        env.simulator.reset_dofs(all_indices,
-                                 dof_pos[cur].unsqueeze(0),
-                                 dof_vel[cur].unsqueeze(0))
-        env.simulator.reset_root_states(all_indices,
-                                        root_pos[cur].unsqueeze(0) + env.simulator.env_origins[all_indices],
-                                        root_rot[cur].unsqueeze(0),
-                                        root_lin_vel[cur].unsqueeze(0),
-                                        root_ang_vel[cur].unsqueeze(0))
+        env.simulator.reset_dofs(batch_indices,
+                                 dof_pos[start_idx:end_idx],
+                                 dof_vel[start_idx:end_idx])
+        env.simulator.reset_root_states(batch_indices,
+                                        root_pos[start_idx:end_idx] + env.simulator.env_origins[batch_indices],
+                                        root_rot[start_idx:end_idx],
+                                        root_lin_vel[start_idx:end_idx],
+                                        root_ang_vel[start_idx:end_idx])
         # step the scene (not the env, to avoid torque control overriding dof positions)
         if SIMULATOR == "genesis":
             env.simulator._scene.step()
@@ -119,21 +139,21 @@ def process_single_motion_file(env, motion_file_path, output_dir):
         else:
             raise ValueError(f"Unsupported simulator: {SIMULATOR}")
 
-        # record the caculated key body pos
-        cur_key_body_pos_relative_to_base = cur_key_body_pos[0] - cur_base_pos[0].unsqueeze(0)
+        # record calculated key body pos for the valid batch envs only
+        cur_key_body_pos_relative_to_base = (
+            cur_key_body_pos[:batch_size] - cur_base_pos[:batch_size].unsqueeze(1)
+        )
         key_body_pos_relative_to_base_list.append(cur_key_body_pos_relative_to_base)
-        env.simulator.draw_debug_vis(cur_key_body_pos)
-        
-        # sleep for the remainder of the frame budget to match real-time playback
-        elapsed = time.perf_counter() - t_start
-        remaining = frame_dt - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
+        if not getattr(env, "headless", False):
+            env.simulator.draw_debug_vis(cur_key_body_pos[:batch_size])
 
-        frame += 1
+        frame_counter += batch_size
+        print_progress("Frame progress", frame_counter, num_frames, loop_start)
+
+    print_progress("Frame progress", num_frames, num_frames, loop_start, force_newline=True)
     
     # update the motion data with the recorded key body pos relative to base, and save to a new .pkl file
-    key_body_pos_relative_to_base = torch.stack(key_body_pos_relative_to_base_list, dim=0)
+    key_body_pos_relative_to_base = torch.cat(key_body_pos_relative_to_base_list, dim=0)
     motion_data = {
         "fps": aligned_fps,
         "root_pos": root_pos.cpu().numpy(),
@@ -162,9 +182,9 @@ def process_single_motion_file(env, motion_file_path, output_dir):
 
 
 def main(args):
-    # Determine input motion file or directory
     # Determine input motion file(s)
     motion_file_dir = LEGGED_GYM_ROOT_DIR + "/resources/reference_motion/"
+    env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     if args.motion_file is not None:
         # Use specified motion file
         motion_input_path = os.path.join(motion_file_dir, args.motion_file)
@@ -180,10 +200,14 @@ def main(args):
             backend=gs.cpu if args.cpu else gs.gpu,
             logging_level='warning',
         )
-    env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
-    env_cfg.env.num_envs = 1 # number of envs
-    env_cfg.viewer.rendered_envs_idx = list(range(env_cfg.env.num_envs))
+
+    cfg_num_envs = int(env_cfg.env.num_envs)
+    cli_num_envs = getattr(args, "num_envs", None)
+    env_cfg.env.num_envs = max(1, int(cli_num_envs) if cli_num_envs is not None else cfg_num_envs)
+    env_cfg.viewer.rendered_envs_idx = [0]
     env_cfg.env.load_motion = False # do not load motion when processing
+    print(f"Using env.num_envs={env_cfg.env.num_envs} for parallel frame processing")
+
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
     env.reset()
@@ -207,10 +231,13 @@ def main(args):
         print(f"Found {len(motion_files)} motion files to process in {motion_input_path}")
         
         processed_files = []
-        for motion_file in motion_files:
+        files_start = time.perf_counter()
+        for idx, motion_file in enumerate(motion_files, start=1):
+            print_progress("File progress", idx - 1, len(motion_files), files_start)
             motion_file_path = os.path.join(motion_input_path, motion_file)
             output_file = process_single_motion_file(env, motion_file_path, output_dir)
             processed_files.append(output_file)
+        print_progress("File progress", len(motion_files), len(motion_files), files_start, force_newline=True)
         
         print(f"\n{'='*60}")
         print(f"Successfully processed {len(processed_files)} motion files:")
