@@ -14,6 +14,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import torch
 
 from legged_gym import PROJECT_ROOT_DIR, SIMULATOR
 from legged_gym.envs import *
@@ -102,6 +103,12 @@ def override_configs_for_recording(env_cfg, task_type: str):
     env_cfg.commands.ranges.lin_vel_y = [0.0, 0.0]
     env_cfg.commands.ranges.ang_vel_yaw = [0.0, 0.0]
     env_cfg.commands.ranges.heading = [0.0, 0.0]
+
+    # Limit AMP motion files to reduce GPU memory usage.
+    # The recorder only runs the policy forward; it does not need
+    # the full motion dataset that the discriminator trains on.
+    if hasattr(env_cfg.env, 'amp_motion_files') and env_cfg.env.amp_motion_files:
+        env_cfg.env.amp_motion_files = env_cfg.env.amp_motion_files[:1]
 
     env_cfg.domain_rand.push_robots = False
     env_cfg.domain_rand.push_links = False
@@ -283,11 +290,29 @@ class RecorderRuntime:
     def set_run_dir(self, run_dir: Path):
         self.run_dir = run_dir
 
+    def destroy_runtime(self):
+        """Release GPU resources held by the environment and runner."""
+        self.policy = None
+        self.runner = None
+        self.env = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def ensure_runtime(self):
         if self.env is not None:
             return
+        # Free any stale CUDA memory before creating a new environment.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         env_cfg, train_cfg = task_registry.get_cfgs(name=self.args.task)
         override_configs_for_recording(env_cfg, self.task_type)
+        # Reduce AMP runner memory: limit motion files and preload transitions.
+        if hasattr(train_cfg.runner, 'amp_motion_files') and train_cfg.runner.amp_motion_files:
+            train_cfg.runner.amp_motion_files = train_cfg.runner.amp_motion_files[:1]
+        if hasattr(train_cfg.runner, 'amp_num_preload_transitions'):
+            train_cfg.runner.amp_num_preload_transitions = 256
+        if hasattr(train_cfg.algorithm, 'amp_replay_buffer_size'):
+            train_cfg.algorithm.amp_replay_buffer_size = 256
         runtime_args = make_runtime_args(self.args.task, self.args.cpu)
         env, _ = task_registry.make_env(name=self.args.task, args=runtime_args, env_cfg=env_cfg)
         train_cfg.runner.resume = False
@@ -641,7 +666,17 @@ def process_checkpoint(runtime: RecorderRuntime, status_store: StatusStore, logg
                 elapsed_s=time.perf_counter() - started_at,
                 traceback=traceback.format_exc(),
             )
-            if attempt >= runtime.args.max_retries:
+
+            # Detect unrecoverable errors: once IsaacGym's PhysX Foundation
+            # is created it cannot be re-created in the same process.
+            is_oom = "CUDA out of memory" in str(exc) or "OutOfMemoryError" in type(exc).__name__
+            is_physx_stuck = "Foundation object exists already" in str(exc)
+            unrecoverable = is_physx_stuck and runtime.env is None
+
+            if is_oom:
+                runtime.destroy_runtime()
+
+            if unrecoverable or attempt >= runtime.args.max_retries:
                 status_store.update(
                     key,
                     status="failed",
@@ -651,12 +686,28 @@ def process_checkpoint(runtime: RecorderRuntime, status_store: StatusStore, logg
                     last_attempt_ts=time.time(),
                     error_message=last_error_message,
                 )
+                if unrecoverable:
+                    logger.event(
+                        "runtime_unrecoverable",
+                        level="ERROR",
+                        message=(
+                            "PhysX Foundation cannot be re-created in this process. "
+                            "This usually happens after a CUDA OOM during environment init. "
+                            "Skipping remaining checkpoints."
+                        ),
+                    )
                 if runtime.args.fail_fast:
                     raise
+                if unrecoverable:
+                    raise RuntimeError("Unrecoverable PhysX state; recorder must restart.")
                 return
             
-            # Log retry attempt with backoff time
-            backoff_time = runtime.args.retry_backoff * (2 ** (attempt - 1))
+            # Use longer backoff for OOM to give the training process time
+            # to release GPU memory between iterations.
+            if is_oom:
+                backoff_time = max(30.0, runtime.args.retry_backoff * (4 ** attempt))
+            else:
+                backoff_time = runtime.args.retry_backoff * (2 ** (attempt - 1))
             logger.event(
                 "checkpoint_retry",
                 level="INFO",
@@ -758,7 +809,17 @@ def main():
                         run_status_store.update(key, status="pending")
                     elif status == "failed":
                         continue
-                    process_checkpoint(runtime, run_status_store, logger, checkpoint_info)
+                    try:
+                        process_checkpoint(runtime, run_status_store, logger, checkpoint_info)
+                    except RuntimeError as exc:
+                        if "Unrecoverable PhysX state" in str(exc):
+                            logger.event(
+                                "recorder_fatal",
+                                level="ERROR",
+                                message="Exiting recorder due to unrecoverable PhysX state (likely CUDA OOM during init).",
+                            )
+                            return
+                        raise
 
             if time.monotonic() >= next_summary_time:
                 logger.set_log_path(None)

@@ -110,7 +110,7 @@ print(config.get("num_envs", 4096))
 PY
 } | tail -n 1)"
 default_num_envs="${default_num_envs:-4096}"
-train_num_envs=$(( default_num_envs * 2 ))
+train_num_envs=$(( default_num_envs * 3 ))
 
 experiment_name="$default_experiment_name"
 if [[ -n "$experiment_name_override" ]]; then
