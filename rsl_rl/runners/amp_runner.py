@@ -115,7 +115,9 @@ class AMPRunner(OnPolicyRunner):
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs, amp_obs)
-                    obs, privileged_obs, rewards, dones, infos, reset_env_ids, terminal_amp_states = self.env.step(actions)  # type: ignore[misc]
+                    obs, privileged_obs, rewards, dones, infos = self.env.step(actions)  # type: ignore[misc]
+                    reset_env_ids = infos["reset_env_ids"]
+                    terminal_amp_states = infos["terminal_amp_states"]
                     next_amp_obs = self.env.get_amp_observations()  # type: ignore[attr-defined]
 
                     critic_obs = privileged_obs if privileged_obs is not None else obs

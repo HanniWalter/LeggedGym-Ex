@@ -4,6 +4,7 @@ from PIL import Image as im
 import torch
 import numpy as np
 import os
+from tqdm.auto import tqdm
 from legged_gym.utils.terrain import Terrain
 from legged_gym.utils.math_utils import *
 if SIMULATOR == "genesis":
@@ -321,6 +322,7 @@ class GenesisSimulator(Simulator):
             self._terrain_y_range[1] = self._cfg.terrain.plane_length/2-1
 
     def _create_envs(self):
+        create_envs_bar = tqdm(total=3, desc="Lade Envs", unit="step", leave=False)
         # Create envs
         if self._cfg.asset.xml_file != "":
             asset_path = self._cfg.asset.xml_file.format(
@@ -335,7 +337,9 @@ class GenesisSimulator(Simulator):
                     quat=np.array([1.0, 0.0, 0.0, 0.0]),  # wxyz
                 )
             )
+            create_envs_bar.update(1)
         else:
+            create_envs_bar.close()
             raise NotImplementedError("Please specify xml file path for Genesis simulator!")
         
         # add camera if needed
@@ -344,6 +348,7 @@ class GenesisSimulator(Simulator):
         
         # build
         self._scene.build(n_envs=self._num_envs)
+        create_envs_bar.update(1)
 
         self._get_env_origins()
 
@@ -384,6 +389,8 @@ class GenesisSimulator(Simulator):
         print(f"key body link indices: {self._key_body_indices}")
         self._base_link_index = self._robot.base_link_idx - self._robot.link_start
         print(f"base link index: {self._base_link_index}")
+        create_envs_bar.update(1)
+        create_envs_bar.close()
         
         if self._cfg.asset.obtain_link_contact_states:
             self._contact_state_link_indices = find_link_indices(

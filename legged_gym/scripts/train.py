@@ -1,4 +1,5 @@
 import os
+import inspect
 
 
 from legged_gym import *
@@ -19,14 +20,24 @@ def train(args):
     log_dir = ppo_runner.log_dir
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
-    if env_cfg.asset.name == args.task:
-        robot_file_path = os.path.join(LEGGED_GYM_ROOT_DIR, "legged_gym", "envs", env_cfg.asset.name, args.task+".py")
-        robot_config_path = os.path.join(LEGGED_GYM_ROOT_DIR, "legged_gym", "envs", env_cfg.asset.name, args.task+"_config.py")
-    else:
-        robot_file_path = os.path.join(LEGGED_GYM_ROOT_DIR, "legged_gym", "envs", env_cfg.asset.name, args.task, args.task+".py")
-        robot_config_path = os.path.join(LEGGED_GYM_ROOT_DIR, "legged_gym", "envs", env_cfg.asset.name, args.task, args.task+"_config.py")
-    shutil.copy(robot_file_path, log_dir)
-    shutil.copy(robot_config_path, log_dir)
+    # Derive paths from the actual registered env class file, not from the task name.
+    # This handles tasks like k1_amp_sac that reuse k1_amp's env class.
+    task_class = task_registry.get_task_class(args.task)
+    env_class_file = inspect.getfile(task_class)
+    env_dir = os.path.dirname(env_class_file)
+    env_basename = os.path.splitext(os.path.basename(env_class_file))[0]  # e.g. "k1_amp"
+    robot_config_candidates = [
+        # <task>_config.py in same dir (standard pattern)
+        os.path.join(env_dir, env_basename + "_config.py"),
+        # <task>_sac_config.py etc. – train config matching the task name
+        os.path.join(env_dir, args.task + "_config.py"),
+    ]
+    if os.path.exists(env_class_file):
+        shutil.copy(env_class_file, log_dir)
+    for cfg_path in robot_config_candidates:
+        if os.path.exists(cfg_path):
+            shutil.copy(cfg_path, log_dir)
+            break
     
     # Start training session
     ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)

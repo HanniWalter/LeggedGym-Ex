@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Type
+from typing import Any, Dict, Type, Union
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -9,9 +9,9 @@ class RunnerRegistry:
     """Registry for runner classes to enable dynamic runner instantiation."""
 
     def __init__(self) -> None:
-        self.runner_classes: Dict[str, Type[OnPolicyRunner]] = {}
+        self.runner_classes: Dict[str, Type] = {}
     
-    def register(self, name: str, runner_class: Type[OnPolicyRunner]) -> None:
+    def register(self, name: str, runner_class: Type) -> None:
         """Register a runner class with a given name.
 
         Args:
@@ -20,7 +20,7 @@ class RunnerRegistry:
         """
         self.runner_classes[name] = runner_class
     
-    def get_runner_class(self, name: str) -> Type[OnPolicyRunner]:
+    def get_runner_class(self, name: str) -> Type:
         """Get a registered runner class by name.
 
         Args:

@@ -39,6 +39,9 @@ from .actor_critic_dreamwaq import ActorCriticDreamWaQ
 from .actor_critic_ts_depth_teacher import ActorCriticTSDepthTeacher
 from .actor_critic_ts_depth import ActorCriticTSDepth
 
+# Import SACActorCritic from algorithms to make it available via modules
+from rsl_rl.algorithms.sac import SACActorCritic
+
 __all__: List[str] = [
     "ActorCritic",
     "ActorCriticRecurrent",
@@ -48,4 +51,5 @@ __all__: List[str] = [
     "ActorCriticDreamWaQ",
     "ActorCriticTSDepthTeacher",
     "ActorCriticTSDepth",
+    "SACActorCritic",
 ]

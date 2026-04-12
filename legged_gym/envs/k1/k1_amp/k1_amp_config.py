@@ -6,12 +6,12 @@ from rsl_rl.utils.symmetry import compute_symmetric_states_k1
 
 import glob
 
-#MOTION_FILES = glob.glob(LEGGED_GYM_ROOT_DIR + f"/resources/reference_motion/booster_k1/{SIMULATOR}_run/*")
-MOTION_FILES = glob.glob(LEGGED_GYM_ROOT_DIR + f"/resources/reference_motion/worldpose_amass_like_all_tracks_K1_22dof_slim/isaacgym_run/*")
+MOTION_FILES = glob.glob(LEGGED_GYM_ROOT_DIR + f"/resources/reference_motion/booster_k1/{SIMULATOR}_run/*")
+#MOTION_FILES = glob.glob(LEGGED_GYM_ROOT_DIR + f"/resources/reference_motion/worldpose_amass_like_all_tracks_K1_22dof_slim/isaacgym_run/*")
 
 class K1AMPCfg(K1FlatCommonCfg):
     class env(K1FlatCommonCfg.env):
-        num_envs = 4096
+        num_envs = 8192
         frame_stack = 5
         num_single_obs = 75
         num_observations = int(num_single_obs * frame_stack)
@@ -37,7 +37,7 @@ class K1AMPCfg(K1FlatCommonCfg):
         only_positive_rewards = False
         class scales(K1FlatCommonCfg.rewards.scales):
             # task
-            tracking_lin_vel = 1.0
+            tracking_lin_vel = 1.2
             tracking_ang_vel = 1.2
             keep_balance = 1.0
             # smooth
@@ -95,7 +95,9 @@ class K1AMPCfg(K1FlatCommonCfg):
         max_curriculum = 1.
         resampling_time = 10.0
         heading_command = False
-        zero_cmd_prob = 0.4
+        # TUNING (Apr11): reduced from 0.4 to 0.2 to decrease idle/standing commands
+        # Less standing = more pressure to walk continuously. Helps escape local optima.
+        zero_cmd_prob = 0.2
         class ranges:
             lin_vel_x = [-0.5, 0.5] # min max [m/s]
             lin_vel_y = [-0.4, 0.4]   # min max [m/s]

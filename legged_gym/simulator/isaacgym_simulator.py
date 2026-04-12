@@ -5,6 +5,7 @@ import sys
 import torch
 import numpy as np
 import os
+from tqdm.auto import tqdm
 from legged_gym.utils.terrain import Terrain
 from legged_gym.utils.math_utils import *
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
@@ -432,7 +433,7 @@ class IsaacGymSimulator(Simulator):
                 local_transform = gymapi.Transform()
                 self._camera_handles = []
         
-        for i in range(self._num_envs):
+        for i in tqdm(range(self._num_envs), desc="Lade Envs", unit="env", leave=False):
             # create env instance
             env_handle = self._gym.create_env(self._sim, env_lower, env_upper, int(np.sqrt(self._num_envs)))
             pos = self._env_origins[i].clone()

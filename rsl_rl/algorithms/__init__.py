@@ -36,3 +36,5 @@ from .ppo_dreamwaq import PPO_DreamWaQ
 from .ppo_ts_depth import PPO_TSDepth
 from .ppo_amp import PPO_AMP
 from .ppo_cts_amp import PPO_CTS_AMP
+from .sac import SAC, SACActorCritic
+from .sac_amp import SAC_AMP

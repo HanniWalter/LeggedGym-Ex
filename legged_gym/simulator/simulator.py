@@ -17,7 +17,9 @@ class Simulator(ABC):
         self._dof_indices = []  # align joint orders in different simulators with the order specified in the config file
         self._parse_cfg()
         self._create_sim()
+        print("erstelle envys")
         self._create_envs()
+        print("envy erstellung abgeschlossen")
         self._init_buffers()
 
     #----- Public methods -----#

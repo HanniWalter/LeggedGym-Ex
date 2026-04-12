@@ -19,13 +19,15 @@ class LeggedRobotAMP(LeggedRobot):
         if self.privileged_obs_buf is not None:
             self.privileged_obs_buf = torch.clip(
                 self.privileged_obs_buf, -clip_obs, clip_obs)
-        return self.obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras,\
-            self.reset_env_ids, self.terminal_amp_states
+        # Standardized AMP extras: put AMP-specific data into extras dict
+        self.extras["reset_env_ids"] = self.reset_env_ids
+        self.extras["terminal_amp_states"] = self.terminal_amp_states
+        return self.obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras
     
     def reset(self):
         """ Reset all robots"""
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
-        obs, privileged_obs, _, _, _, _, _ = self.step(torch.zeros(
+        obs, privileged_obs, _, _, _ = self.step(torch.zeros(
             self.num_envs, self.num_actions, device=self.device, requires_grad=False))
         return obs, privileged_obs
     

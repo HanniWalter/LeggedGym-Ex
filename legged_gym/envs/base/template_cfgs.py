@@ -213,3 +213,116 @@ class LeggedRobotEECfgPPO(LeggedRobotCfgPPO):
     class runner( LeggedRobotCfgPPO.runner ):
         policy_class_name = 'ActorCriticEE'
         algorithm_class_name = 'PPO_EE'
+
+
+# ----- Template configuration for SAC -----#
+class LeggedRobotCfgSAC(LeggedRobotCfgPPO):
+    """SAC configuration template for locomotion tasks."""
+    seed = 1
+    runner_class_name = 'SACRunner'
+    class policy:
+        clip_actions = 100.0
+        init_noise_std = 1.0
+        actor_hidden_dims = [256, 256, 256]
+        critic_hidden_dims = [256, 256, 256]
+        activation = 'relu'
+        use_layer_norm = True
+
+    class algorithm:
+        learning_rate = 3e-4
+        alpha_lr = 3e-4
+        gamma = 0.99
+        tau = 0.005
+        init_alpha = 1.0
+        auto_alpha = True
+        batch_size = 256
+        utd_ratio = 1
+        max_grad_norm = 1.0
+        policy_delay = 1       # update actor every N critic updates
+        use_adamw = False
+        n_step = 1             # n-step returns (1 = standard TD)
+        normalize_observations = True
+        temporal_noise_steps = 0  # hold exploration noise for N steps (0 = disabled)
+
+    class runner:
+        policy_class_name = 'SACActorCritic'
+        algorithm_class_name = 'SAC'
+        num_steps_per_env = 24
+        max_iterations = 3000
+        replay_buffer_size = 1_000_000
+        warmup_steps = 1000
+        sync_wandb = False
+        save_interval = 200
+        experiment_name = 'test_sac'
+        run_name = ''
+        resume = False
+        load_run = -1
+        checkpoint = -1
+        resume_path = None
+
+
+# ----- Template configuration for SAC + AMP -----#
+class LeggedRobotAMPCfgSAC(LeggedRobotCfgSAC):
+    """SAC + AMP configuration template for motion imitation tasks."""
+    runner_class_name = 'SACAMPRunner'
+
+    class algorithm(LeggedRobotCfgSAC.algorithm):
+        amp_replay_buffer_size = 1_000_000
+        disc_lr = 1e-4
+
+    class runner(LeggedRobotCfgSAC.runner):
+        algorithm_class_name = 'SAC_AMP'
+
+        amp_reward_coef = 2.0
+        amp_motion_files = MOTION_FILES
+        amp_num_preload_transitions = 2_000_000
+        amp_discr_hidden_dims = [1024, 512]
+        amp_task_reward_lerp = 0.3
+
+
+# ----- Template configuration for FastSAC (high UTD) -----#
+class LeggedRobotCfgFastSAC(LeggedRobotCfgSAC):
+    """FastSAC: SAC with high update-to-data (UTD) ratio for faster training.
+
+    Key differences from standard SAC:
+    - Larger batch size (1024 vs 256)
+    - Higher UTD ratio (20 vs 1) – many gradient steps per env step
+    - Larger replay buffer
+    - Lower tau for slower target updates (compensates for high UTD)
+    """
+    class policy(LeggedRobotCfgSAC.policy):
+        actor_hidden_dims = [256, 256, 256]
+        critic_hidden_dims = [256, 256, 256]
+
+    class algorithm(LeggedRobotCfgSAC.algorithm):
+        batch_size = 1024
+        utd_ratio = 20
+        tau = 0.005
+        learning_rate = 3e-4
+        alpha_lr = 1e-4
+
+    class runner(LeggedRobotCfgSAC.runner):
+        replay_buffer_size = 2_000_000
+        warmup_steps = 5000
+        num_steps_per_env = 1
+        experiment_name = 'test_fastsac'
+
+
+# ----- Template configuration for FastSAC + AMP -----#
+class LeggedRobotAMPCfgFastSAC(LeggedRobotCfgFastSAC):
+    """FastSAC + AMP for motion imitation with high UTD ratio."""
+    runner_class_name = 'SACAMPRunner'
+
+    class algorithm(LeggedRobotCfgFastSAC.algorithm):
+        amp_replay_buffer_size = 2_000_000
+        disc_lr = 1e-4
+
+    class runner(LeggedRobotCfgFastSAC.runner):
+        algorithm_class_name = 'SAC_AMP'
+
+        amp_reward_coef = 2.0
+        amp_motion_files = MOTION_FILES
+        amp_num_preload_transitions = 2_000_000
+        amp_discr_hidden_dims = [1024, 512]
+        amp_task_reward_lerp = 0.3
+        experiment_name = 'test_fastsac_amp'

@@ -161,10 +161,13 @@ def interaction_loop(env, policy, args, task_type):
             obs_buf, privileged_obs_buf, obs_history, explicit_labels, next_states, rews, dones, infos = env.step(actions.detach())
         elif task_type == "amp":
             actions = policy(obs_buf.detach())
-            obs_buf, _, rews, dones, infos, _, _ = env.step(actions.detach())
+            obs_buf, _, rews, dones, infos = env.step(actions.detach())
         elif task_type == "cts_amp":
             actions = policy(obs_buf, obs_history)
-            obs_buf, privileged_obs_buf, obs_history, critic_obs, rews, dones, infos, _, _ = env.step(actions.detach())
+            obs_buf, privileged_obs_buf, obs_history, critic_obs, rews, dones, infos = env.step(actions.detach())
+        elif task_type == "sac" or task_type == "sac_amp":
+            actions = policy(obs_buf.detach())
+            obs_buf, _, rews, dones, infos = env.step(actions.detach())
         else:
             actions = policy(obs_buf.detach())
             obs_buf, _, rews, dones, infos = env.step(actions.detach())

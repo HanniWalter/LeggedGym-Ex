@@ -196,12 +196,12 @@ def step_task(env, policy, task_type: str, state: dict):
         return state, rews, dones, infos
     if task_type == "amp":
         actions = policy(state["obs_buf"].detach())
-        obs_buf, _, rews, dones, infos, _, _ = env.step(actions.detach())
+        obs_buf, _, rews, dones, infos = env.step(actions.detach())
         state.update(obs_buf=obs_buf)
         return state, rews, dones, infos
     if task_type == "cts_amp":
         actions = policy(state["obs_buf"], state["obs_history"])
-        obs_buf, privileged_obs_buf, obs_history, critic_obs, rews, dones, infos, _, _ = env.step(actions.detach())
+        obs_buf, privileged_obs_buf, obs_history, critic_obs, rews, dones, infos = env.step(actions.detach())
         state.update(
             obs_buf=obs_buf,
             privileged_obs_buf=privileged_obs_buf,

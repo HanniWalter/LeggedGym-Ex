@@ -3,6 +3,7 @@ from legged_gym.simulator.simulator import Simulator
 from PIL import Image as im
 import torch
 import numpy as np
+from tqdm.auto import tqdm
 from legged_gym.utils.terrain import Terrain
 from legged_gym.utils.math_utils import *
 if SIMULATOR == "isaaclab":
@@ -264,6 +265,7 @@ class IsaacLabSimulator(Simulator):
     def _create_envs(self):
         """ Creates environments, adds the robot asset to each environment, sets DOF properties and calls callbacks to process rigid shape, rigid body and DOF properties.
         """
+        create_envs_bar = tqdm(total=4, desc="Lade Envs", unit="step", leave=False)
         from isaacsim.core.cloner import Cloner
         import isaaclab.sim as sim_utils
         from isaaclab.assets import Articulation, ArticulationCfg
@@ -339,6 +341,7 @@ class IsaacLabSimulator(Simulator):
                 soft_joint_pos_limit_factor=self._cfg.rewards.soft_dof_pos_limit
             )
         self._robot = Articulation(articulation_cfg)
+        create_envs_bar.update(1)
         # clone other envs
         self._cloner.clone(source_prim_path=f"/World/envs/env_0",
                            prim_paths=prim_paths,
@@ -346,6 +349,7 @@ class IsaacLabSimulator(Simulator):
                            replicate_physics=True,
                            base_env_path=f"/World/envs",
                            enable_env_ids=True)
+        create_envs_bar.update(1)
         
         # Add contact sensors
         contact_sensor_cfg = ContactSensorCfg(
@@ -372,6 +376,7 @@ class IsaacLabSimulator(Simulator):
         env_prim_paths = [f"/World/envs/env_{i}" for i in range(self._num_envs)]
         self._cloner.filter_collisions(physics_scene_path, "/World/collisions",
                                        env_prim_paths, global_paths=[GROUND_PATH])
+        create_envs_bar.update(1)
         
         # reset the simulation to make sure everything is initialized
         self._sim.reset()
@@ -389,6 +394,8 @@ class IsaacLabSimulator(Simulator):
         print(f"dof indices: {self._dof_indices}")
         self._num_dof = len(self._dof_names)
         self._num_bodies = len(self._robot.body_names)
+        create_envs_bar.update(1)
+        create_envs_bar.close()
         
         def find_link_contact_indices(names: list[str]) -> list[int]:
             """find link indices in bodies of contact sensors based on link names specified in the config for termination and penalty.

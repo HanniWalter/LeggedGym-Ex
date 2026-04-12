@@ -115,8 +115,9 @@ class CTS_AMP_Runner(OnPolicyRunner):
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, privileged_obs, obs_history, critic_obs, amp_obs)
-                    obs, privileged_obs, obs_history, critic_obs, rewards, dones, infos, \
-                        reset_env_ids, terminal_amp_states = self.env.step(actions)
+                    obs, privileged_obs, obs_history, critic_obs, rewards, dones, infos = self.env.step(actions)
+                    reset_env_ids = infos["reset_env_ids"]
+                    terminal_amp_states = infos["terminal_amp_states"]
                     next_amp_obs = self.env.get_amp_observations()
                     obs, privileged_obs, obs_history, rewards, dones, critic_obs, next_amp_obs = obs.to(self.device), \
                         privileged_obs.to(self.device), obs_history.to(self.device), rewards.to(self.device), dones.to(self.device), \

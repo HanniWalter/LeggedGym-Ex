@@ -110,7 +110,7 @@ print(config.get("num_envs", 4096))
 PY
 } | tail -n 1)"
 default_num_envs="${default_num_envs:-4096}"
-train_num_envs=$(( default_num_envs * 3 ))
+train_num_envs=$(( default_num_envs))
 
 experiment_name="$default_experiment_name"
 if [[ -n "$experiment_name_override" ]]; then
@@ -177,7 +177,7 @@ log_launcher "training log: $training_log_file"
 log_launcher "watcher log: $watcher_log_file"
 log_launcher "training output is mirrored to the terminal"
 
-log_launcher "training with num_envs=$train_num_envs (2x default $default_num_envs)"
+log_launcher "training with num_envs=$train_num_envs"
 
 PYTHONUNBUFFERED=1 "$python_bin" -m legged_gym.scripts.train \
     --task "$task" \
