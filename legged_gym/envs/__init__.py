@@ -44,6 +44,7 @@ from legged_gym.envs.k1.k1_deepmimic.k1_deepmimic_config import K1DeepMimicCfg, 
 from legged_gym.envs.k1.k1_amp.k1_amp import K1AMP
 from legged_gym.envs.k1.k1_amp.k1_amp_config import K1AMPCfg, K1AMPCfgPPO
 from legged_gym.envs.k1.k1_amp.k1_amp_sac_config import K1AMPSACEnvCfg, K1AMPCfgSAC, K1AMPCfgFastSAC
+from legged_gym.envs.k1.k1_amp.k1_amp_flash_sac_config import K1AMPFlashSACEnvCfg, K1AMPCfgFlashSAC
 # k1 cts amp
 from legged_gym.envs.k1.k1_cts_amp.k1_cts_amp import K1_CTS_AMP
 from legged_gym.envs.k1.k1_cts_amp.k1_cts_amp_config import K1_CTS_AMPCfg, K1_CTS_AMPCfgPPO
@@ -110,6 +111,7 @@ task_registry.register("k1_motion_vis_20dof", K1MotionVis, K1MotionVis20DofCfg()
 task_registry.register("k1_amp", K1AMP, K1AMPCfg(), K1AMPCfgPPO())
 task_registry.register("k1_amp_sac", K1AMP, K1AMPSACEnvCfg(), K1AMPCfgSAC())
 task_registry.register("k1_amp_fastsac", K1AMP, K1AMPCfg(), K1AMPCfgFastSAC())
+task_registry.register("k1_amp_flashsac", K1AMP, K1AMPFlashSACEnvCfg(), K1AMPCfgFlashSAC())
 task_registry.register("k1_cts_amp", K1_CTS_AMP, K1_CTS_AMPCfg(), K1_CTS_AMPCfgPPO()) # unvalidated
 task_registry.register("g1", G1Robot, G1RoughCfg(), G1RoughCfgPPO())
 task_registry.register("g1_deepmimic", G1DeepMimic, G1DeepMimicCfg(), G1DeepMimicCfgPPO())

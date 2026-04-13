@@ -388,6 +388,7 @@ class SAC:
         buffer_size: int,
         obs_dim: int,
         action_dim: int,
+        amp_obs_dim: int = 0,
     ) -> None:
         """Initialize the replay buffer and observation normalizer."""
         self.replay_buffer = SACReplayBuffer(
@@ -398,6 +399,7 @@ class SAC:
             n_step=self.n_step,
             gamma=self.gamma,
             num_envs=num_envs,
+            amp_obs_dim=amp_obs_dim,
         )
         if self.normalize_observations:
             self._obs_normalizer = EmpiricalNormalization(
@@ -439,10 +441,12 @@ class SAC:
         rewards: torch.Tensor,
         next_obs: torch.Tensor,
         dones: torch.Tensor,
+        amp_obs: Optional[torch.Tensor] = None,
+        next_amp_obs: Optional[torch.Tensor] = None,
     ) -> None:
         """Store a batch of transitions in the replay buffer."""
         assert self.replay_buffer is not None
-        self.replay_buffer.insert(obs, actions, rewards, next_obs, dones)
+        self.replay_buffer.insert(obs, actions, rewards, next_obs, dones, amp_obs, next_amp_obs)
 
     def update(self) -> Dict[str, float]:
         """Perform SAC update (critic + actor with policy delay + alpha).
@@ -476,7 +480,8 @@ class SAC:
         gamma_n = self.gamma ** self.n_step
 
         for update_i in range(self.utd_ratio):
-            obs, actions, rewards, next_obs, dones = self.replay_buffer.sample(self.batch_size)
+            sample = self.replay_buffer.sample(self.batch_size)
+            obs, actions, rewards, next_obs, dones = sample[:5]
 
             # ─── Observation normalization ───
             obs = self._normalize_obs(obs, update=True)
@@ -594,7 +599,7 @@ class SAC:
 
         return metrics
 
-    def update_reward_stats(self, rewards: torch.Tensor) -> None:
+    def update_reward_stats(self, rewards: torch.Tensor, dones: torch.Tensor = None) -> None:
         """Update running reward statistics for normalization."""
         batch_mean = rewards.mean().item()
         batch_var = rewards.var().item()

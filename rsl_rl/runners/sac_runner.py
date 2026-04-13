@@ -70,7 +70,15 @@ class SACRunner:
         self.save_interval: int = self.cfg.get("save_interval", 200)
         self.num_steps_per_env: int = self.cfg.get("num_steps_per_env", 24)
         self.replay_buffer_size: int = self.cfg.get("replay_buffer_size", 1_000_000)
-        self.warmup_steps: int = self.cfg.get("warmup_steps", 1000)
+        
+        # Warmup steps: either absolute value or computed from multiplier
+        warmup_steps_cfg = self.cfg.get("warmup_steps", 1000)
+        warmup_multiplier = self.cfg.get("warmup_steps_per_env", None)
+        if warmup_multiplier is not None:
+            self.warmup_steps: int = int(self.env.num_envs * warmup_multiplier)
+        else:
+            self.warmup_steps: int = warmup_steps_cfg
+        
         self.updates_per_step: int = self.alg_cfg.get("utd_ratio", 1)
 
         self._init_storage()

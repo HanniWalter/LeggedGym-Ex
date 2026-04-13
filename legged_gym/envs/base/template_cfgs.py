@@ -326,3 +326,69 @@ class LeggedRobotAMPCfgFastSAC(LeggedRobotCfgFastSAC):
         amp_discr_hidden_dims = [1024, 512]
         amp_task_reward_lerp = 0.3
         experiment_name = 'test_fastsac_amp'
+
+
+# ----- Template configuration for FlashSAC + AMP -----#
+class LeggedRobotAMPCfgFlashSAC(LeggedRobotCfgSAC):
+    """FlashSAC + AMP template config with residual/distributional SAC backend."""
+    runner_class_name = 'FlashSACAMPRunner'
+
+    class policy:
+        clip_actions = 1.0
+        init_noise_std = 1.0
+        actor_num_blocks = 2
+        actor_hidden_dim = 128
+        critic_num_blocks = 2
+        critic_hidden_dim = 256
+        critic_num_bins = 101
+        critic_min_v = -5.0
+        critic_max_v = 5.0
+
+    class algorithm:
+        learning_rate = 3e-4
+        alpha_lr = 3e-4
+        gamma = 0.99
+        tau = 0.01
+        init_alpha = 0.01
+        auto_alpha = True
+        batch_size = 2048
+        utd_ratio = 2
+        max_grad_norm = 1.0
+        policy_delay = 2
+        use_adamw = False
+        n_step = 1
+        normalize_rewards = True
+        normalize_observations = False
+        temporal_noise_steps = 0
+        noise_zeta_mu = 2.0
+        noise_zeta_max = 16
+        temp_target_sigma = 0.15
+        critic_num_bins = 101
+        critic_min_v = -5.0
+        critic_max_v = 5.0
+        learning_rate_end = 1.5e-4
+        learning_rate_decay_steps = 0   # 0 = constant LR; set > 0 to enable cosine decay
+        amp_replay_buffer_size = 1_000_000
+        disc_lr = 1e-4
+
+    class runner:
+        policy_class_name = 'FlashSACActorCritic'
+        algorithm_class_name = 'FlashSAC_AMP'
+        num_steps_per_env = 24
+        max_iterations = 3000
+        replay_buffer_size = 1_000_000
+        warmup_steps = 1000
+        sync_wandb = False
+        save_interval = 200
+        experiment_name = 'test_flashsac_amp'
+        run_name = ''
+        resume = False
+        load_run = -1
+        checkpoint = -1
+        resume_path = None
+
+        amp_reward_coef = 2.0
+        amp_motion_files = MOTION_FILES
+        amp_num_preload_transitions = 2_000_000
+        amp_discr_hidden_dims = [1024, 512]
+        amp_task_reward_lerp = 0.3

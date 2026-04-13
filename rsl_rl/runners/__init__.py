@@ -38,6 +38,7 @@ from .amp_runner import AMPRunner
 from .cts_amp_runner import CTS_AMP_Runner
 from .sac_runner import SACRunner
 from .sac_amp_runner import SACAMPRunner
+from .flash_sac_amp_runner import FlashSACAMPRunner
 
 from rsl_rl.utils.runner_registry import runner_registry
 runner_registry.register("OnPolicyRunner", OnPolicyRunner)
@@ -50,3 +51,4 @@ runner_registry.register("AMPRunner", AMPRunner)
 runner_registry.register("CTS_AMP_Runner", CTS_AMP_Runner)
 runner_registry.register("SACRunner", SACRunner)
 runner_registry.register("SACAMPRunner", SACAMPRunner)
+runner_registry.register("FlashSACAMPRunner", FlashSACAMPRunner)

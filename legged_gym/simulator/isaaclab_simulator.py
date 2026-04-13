@@ -265,7 +265,7 @@ class IsaacLabSimulator(Simulator):
     def _create_envs(self):
         """ Creates environments, adds the robot asset to each environment, sets DOF properties and calls callbacks to process rigid shape, rigid body and DOF properties.
         """
-        create_envs_bar = tqdm(total=4, desc="Lade Envs", unit="step", leave=False)
+        create_envs_bar = tqdm(total=4, desc="Loading Envs", unit="step", leave=True)
         from isaacsim.core.cloner import Cloner
         import isaaclab.sim as sim_utils
         from isaaclab.assets import Articulation, ArticulationCfg

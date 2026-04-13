@@ -41,6 +41,7 @@ from .actor_critic_ts_depth import ActorCriticTSDepth
 
 # Import SACActorCritic from algorithms to make it available via modules
 from rsl_rl.algorithms.sac import SACActorCritic
+from .flash_sac_actor_critic import FlashSACActorCritic
 
 __all__: List[str] = [
     "ActorCritic",
@@ -52,4 +53,5 @@ __all__: List[str] = [
     "ActorCriticTSDepthTeacher",
     "ActorCriticTSDepth",
     "SACActorCritic",
+    "FlashSACActorCritic",
 ]

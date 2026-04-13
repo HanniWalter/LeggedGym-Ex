@@ -38,3 +38,5 @@ from .ppo_amp import PPO_AMP
 from .ppo_cts_amp import PPO_CTS_AMP
 from .sac import SAC, SACActorCritic
 from .sac_amp import SAC_AMP
+from .flash_sac import FlashSAC
+from .flash_sac_amp import FlashSAC_AMP

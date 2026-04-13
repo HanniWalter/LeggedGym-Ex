@@ -51,6 +51,7 @@ class SACAMPRunner(SACRunner):
 
         # Build AMPManager from runner config
         amp_obs_dim = self.env.get_amp_observations().shape[-1]  # type: ignore[attr-defined]
+        self._amp_obs_dim = amp_obs_dim
 
         self.amp_manager = AMPManager(
             device=self.device,
@@ -66,6 +67,26 @@ class SACAMPRunner(SACRunner):
             num_key_bodies=len(self.env.simulator.key_body_indices),  # type: ignore[attr-defined]
             time_between_frames=self.env.dt,  # type: ignore[attr-defined]
             num_preload_transitions=self.cfg.get("amp_num_preload_transitions", 2_000_000),
+        )
+
+        # Set fresh AMP reward callback on the algorithm so it re-computes
+        # AMP rewards at training time instead of using stale stored values.
+        if hasattr(self.alg, 'amp_reward_fn'):
+            def _fresh_amp_reward(amp_obs: torch.Tensor, next_amp_obs: torch.Tensor, task_rewards: torch.Tensor) -> torch.Tensor:
+                blended, _ = self.amp_manager.compute_reward(amp_obs, next_amp_obs, task_rewards.squeeze(-1))
+                return blended.unsqueeze(-1)
+            self.alg.amp_reward_fn = _fresh_amp_reward
+
+    def _init_storage(self) -> None:
+        """Initialize SAC replay buffer with AMP observation storage."""
+        obs_dim = self.env.num_obs
+        amp_obs_dim = getattr(self, '_amp_obs_dim', 0)
+        self.alg.init_storage(
+            num_envs=self.env.num_envs,
+            buffer_size=self.replay_buffer_size,
+            obs_dim=obs_dim,
+            action_dim=self.env.num_actions,
+            amp_obs_dim=amp_obs_dim,
         )
 
     def learn(
@@ -125,13 +146,16 @@ class SACAMPRunner(SACRunner):
                     if reset_env_ids is not None and terminal_amp_states is not None and len(reset_env_ids) > 0:
                         next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
 
-                    # Blend rewards
+                    # Blend rewards (for logging only — fresh rewards recomputed during training)
                     blended_rewards, amp_reward = self.amp_manager.compute_reward(
                         amp_obs, next_amp_obs_with_term, rewards
                     )
 
-                    # Store AMP transition
+                    # Store AMP transition for discriminator training
                     self.amp_manager.store_transition(amp_obs, next_amp_obs_with_term)
+
+                    # Save current amp_obs for replay buffer BEFORE advancing
+                    amp_obs_for_store = amp_obs.clone()
                     amp_obs = torch.clone(next_amp_obs)
 
                     # Handle timeouts
@@ -142,11 +166,17 @@ class SACAMPRunner(SACRunner):
                     else:
                         effective_dones = dones_f
 
-                    # Store in SAC replay buffer (with blended rewards)
-                    self.alg.store_transition(obs, actions, blended_rewards, next_obs, effective_dones)
-                    # Update reward normalization stats
+                    # Store RAW task rewards + AMP obs in replay buffer.
+                    # Fresh AMP rewards will be recomputed at training time using
+                    # the current discriminator (avoids stale reward problem).
+                    self.alg.store_transition(
+                        obs, actions, rewards, next_obs, effective_dones,
+                        amp_obs=amp_obs_for_store, next_amp_obs=next_amp_obs_with_term,
+                    )
+                    # Update reward normalization stats with blended rewards
+                    # (these track the actual return scale for the normalizer)
                     if self.alg.normalize_rewards:
-                        self.alg.update_reward_stats(blended_rewards)
+                        self.alg.update_reward_stats(blended_rewards, dones_f)
                     obs = next_obs.clone()
                     total_env_steps += self.env.num_envs
                     steps_this_iter += 1
@@ -293,7 +323,7 @@ class SACAMPRunner(SACRunner):
         # Q-value and action diagnostics
         for diag_key in ("q1_mean", "q2_mean", "target_q_mean", "td_target_mean",
                          "action_abs_mean", "log_prob_mean",
-                         "critic_updates", "actor_updates"):
+                         "critic_updates", "actor_updates", "learning_rate"):
             if diag_key in update_info:
                 self.writer.add_scalar(f"SAC/{diag_key}", update_info[diag_key], it)
                 wandb_scalars[f"SAC/{diag_key}"] = update_info[diag_key]

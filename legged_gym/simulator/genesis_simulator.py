@@ -322,7 +322,7 @@ class GenesisSimulator(Simulator):
             self._terrain_y_range[1] = self._cfg.terrain.plane_length/2-1
 
     def _create_envs(self):
-        create_envs_bar = tqdm(total=3, desc="Lade Envs", unit="step", leave=False)
+        create_envs_bar = tqdm(total=3, desc="Loading Envs", unit="step", leave=True)
         # Create envs
         if self._cfg.asset.xml_file != "":
             asset_path = self._cfg.asset.xml_file.format(

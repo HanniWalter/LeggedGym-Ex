@@ -6,7 +6,7 @@ Supports optional n-step returns for improved sample efficiency.
 
 from __future__ import annotations
 
-from typing import Generator, Tuple, Union
+from typing import Generator, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -42,20 +42,33 @@ class SACReplayBuffer:
         n_step: int = 1,
         gamma: float = 0.99,
         num_envs: int = 1,
+        amp_obs_dim: int = 0,
     ) -> None:
         self.device = torch.device(device)
         self.buffer_size = buffer_size
         self.obs_dim = obs_dim
         self.action_dim = action_dim
+        self.amp_obs_dim = amp_obs_dim
         self.n_step = max(1, n_step)
         self.gamma = gamma
         self.num_envs = num_envs
 
-        self.observations = torch.zeros(buffer_size, obs_dim, device=self.device)
-        self.actions = torch.zeros(buffer_size, action_dim, device=self.device)
-        self.rewards = torch.zeros(buffer_size, 1, device=self.device)
-        self.next_observations = torch.zeros(buffer_size, obs_dim, device=self.device)
-        self.dones = torch.zeros(buffer_size, 1, device=self.device)
+        # Main buffer lives on CPU in float16 to minimize RAM usage.
+        # Obs at float16 halves the dominant cost (2×obs_dim per transition).
+        # Actions/rewards/dones kept as float32 (small, precision matters).
+        # Samples are cast to float32 and moved to self.device in sample().
+        self._storage_device = torch.device("cpu")
+        self.observations = torch.zeros(buffer_size, obs_dim, dtype=torch.float16, device=self._storage_device)
+        self.actions = torch.zeros(buffer_size, action_dim, dtype=torch.float32, device=self._storage_device)
+        self.rewards = torch.zeros(buffer_size, 1, dtype=torch.float32, device=self._storage_device)
+        self.next_observations = torch.zeros(buffer_size, obs_dim, dtype=torch.float16, device=self._storage_device)
+        self.dones = torch.zeros(buffer_size, 1, dtype=torch.float32, device=self._storage_device)
+
+        # Optional AMP observation storage for fresh reward re-computation
+        self.has_amp = amp_obs_dim > 0
+        if self.has_amp:
+            self.amp_observations = torch.zeros(buffer_size, amp_obs_dim, dtype=torch.float16, device=self._storage_device)
+            self.next_amp_observations = torch.zeros(buffer_size, amp_obs_dim, dtype=torch.float16, device=self._storage_device)
 
         self.step = 0
         self.num_samples = 0
@@ -81,6 +94,8 @@ class SACReplayBuffer:
         rewards: torch.Tensor,
         next_obs: torch.Tensor,
         dones: torch.Tensor,
+        amp_obs: Optional[torch.Tensor] = None,
+        next_amp_obs: Optional[torch.Tensor] = None,
     ) -> None:
         """Add a batch of transitions to the buffer.
 
@@ -93,7 +108,7 @@ class SACReplayBuffer:
         dones = dones.view(-1, 1)
 
         if self.n_step <= 1:
-            self._insert_batch(obs, actions, rewards, next_obs, dones)
+            self._insert_batch(obs, actions, rewards, next_obs, dones, amp_obs, next_amp_obs)
             return
 
         ea = self._env_arange  # (num_envs,)
@@ -173,11 +188,23 @@ class SACReplayBuffer:
         rewards: torch.Tensor,
         next_obs: torch.Tensor,
         dones: torch.Tensor,
+        amp_obs: Optional[torch.Tensor] = None,
+        next_amp_obs: Optional[torch.Tensor] = None,
     ) -> None:
         """Insert a batch directly into the main circular buffer."""
         batch_size = obs.shape[0]
         rewards = rewards.view(-1, 1)
         dones = dones.view(-1, 1)
+        # Move to CPU storage; cast obs/next_obs to float16 to save RAM
+        obs = obs.to(dtype=torch.float16, device=self._storage_device, non_blocking=True)
+        actions = actions.to(self._storage_device, non_blocking=True)
+        rewards = rewards.to(self._storage_device, non_blocking=True)
+        next_obs = next_obs.to(dtype=torch.float16, device=self._storage_device, non_blocking=True)
+        dones = dones.to(self._storage_device, non_blocking=True)
+
+        if self.has_amp and amp_obs is not None:
+            amp_obs = amp_obs.to(dtype=torch.float16, device=self._storage_device, non_blocking=True)
+            next_amp_obs = next_amp_obs.to(dtype=torch.float16, device=self._storage_device, non_blocking=True)
 
         if self.step + batch_size > self.buffer_size:
             # Wrap around
@@ -194,6 +221,12 @@ class SACReplayBuffer:
             self.rewards[:remaining] = rewards[first_part:]
             self.next_observations[:remaining] = next_obs[first_part:]
             self.dones[:remaining] = dones[first_part:]
+
+            if self.has_amp and amp_obs is not None:
+                self.amp_observations[self.step:self.buffer_size] = amp_obs[:first_part]
+                self.next_amp_observations[self.step:self.buffer_size] = next_amp_obs[:first_part]
+                self.amp_observations[:remaining] = amp_obs[first_part:]
+                self.next_amp_observations[:remaining] = next_amp_obs[first_part:]
         else:
             end = self.step + batch_size
             self.observations[self.step:end] = obs
@@ -202,10 +235,14 @@ class SACReplayBuffer:
             self.next_observations[self.step:end] = next_obs
             self.dones[self.step:end] = dones
 
+            if self.has_amp and amp_obs is not None:
+                self.amp_observations[self.step:end] = amp_obs
+                self.next_amp_observations[self.step:end] = next_amp_obs
+
         self.num_samples = min(self.buffer_size, max(self.step + batch_size, self.num_samples))
         self.step = (self.step + batch_size) % self.buffer_size
 
-    def sample(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def sample(self, batch_size: int) -> Tuple[torch.Tensor, ...]:
         """Sample a random batch of transitions.
 
         Args:
@@ -213,15 +250,23 @@ class SACReplayBuffer:
 
         Returns:
             Tuple of (obs, actions, rewards, next_obs, dones), each as tensors.
+            If amp_obs_dim > 0, also returns (amp_obs, next_amp_obs).
         """
         idxs = np.random.randint(0, self.num_samples, size=batch_size)
-        return (
-            self.observations[idxs],
-            self.actions[idxs],
-            self.rewards[idxs],
-            self.next_observations[idxs],
-            self.dones[idxs],
+        # Cast obs back to float32 for training; other fields are already float32
+        result = (
+            self.observations[idxs].to(dtype=torch.float32, device=self.device, non_blocking=True),
+            self.actions[idxs].to(self.device, non_blocking=True),
+            self.rewards[idxs].to(self.device, non_blocking=True),
+            self.next_observations[idxs].to(dtype=torch.float32, device=self.device, non_blocking=True),
+            self.dones[idxs].to(self.device, non_blocking=True),
         )
+        if self.has_amp:
+            result = result + (
+                self.amp_observations[idxs].to(dtype=torch.float32, device=self.device, non_blocking=True),
+                self.next_amp_observations[idxs].to(dtype=torch.float32, device=self.device, non_blocking=True),
+            )
+        return result
 
     @property
     def size(self) -> int:

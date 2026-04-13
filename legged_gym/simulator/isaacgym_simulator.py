@@ -433,7 +433,7 @@ class IsaacGymSimulator(Simulator):
                 local_transform = gymapi.Transform()
                 self._camera_handles = []
         
-        for i in tqdm(range(self._num_envs), desc="Lade Envs", unit="env", leave=False):
+        for i in tqdm(range(self._num_envs), desc="Loading Envs", unit="env", leave=True):
             # create env instance
             env_handle = self._gym.create_env(self._sim, env_lower, env_upper, int(np.sqrt(self._num_envs)))
             pos = self._env_origins[i].clone()
