@@ -56,6 +56,20 @@ class FlashSAC:
         self.target_critic = copy.deepcopy(actor_critic.critic).to(self.device)
         self.target_critic.eval()
 
+        # FP16 mixed-precision (paper feature)
+        self._use_amp = self.device.type == "cuda"
+        self._grad_scaler = torch.amp.GradScaler("cuda", enabled=self._use_amp)
+        if self._use_amp:
+            torch.set_float32_matmul_precision("high")  # enable TF32 tensor cores
+
+        # torch.compile actor & critic for throughput (paper feature)
+        try:
+            self.actor_critic.actor = torch.compile(self.actor_critic.actor, mode="reduce-overhead")
+            self.actor_critic.critic = torch.compile(self.actor_critic.critic, mode="reduce-overhead")
+            self.target_critic = torch.compile(self.target_critic, mode="reduce-overhead")
+        except Exception:
+            pass  # graceful fallback if compile not supported
+
         opt_class = optim.AdamW if use_adamw else optim.Adam
         self.actor_optimizer = opt_class(self.actor_critic.actor.parameters(), lr=learning_rate)
         self.critic_optimizer = opt_class(self.actor_critic.critic.parameters(), lr=learning_rate)
@@ -280,24 +294,27 @@ class FlashSAC:
             # ── Step 1: Actor update (matches reference: actor before critic) ──
             do_actor_update = (self._critic_update_count % self.policy_delay == 0)
             if do_actor_update:
-                # Forward actor on [obs, next_obs] for better BatchNorm statistics
-                actor_obs_all = torch.cat([obs, next_obs], dim=0)
-                all_actions, all_info = self.actor_critic.actor(actor_obs_all, training=True)
-                new_actions = torch.chunk(all_actions, 2, dim=0)[0]
-                log_probs = torch.chunk(all_info["log_prob"], 2, dim=0)[0]
+                with torch.amp.autocast("cuda", enabled=self._use_amp):
+                    # Forward actor on [obs, next_obs] for better BatchNorm statistics
+                    actor_obs_all = torch.cat([obs, next_obs], dim=0)
+                    all_actions, all_info = self.actor_critic.actor(actor_obs_all, training=True)
+                    new_actions = torch.chunk(all_actions, 2, dim=0)[0]
+                    log_probs = torch.chunk(all_info["log_prob"], 2, dim=0)[0]
 
-                # Evaluate Q without flowing gradients into critic
-                self.actor_critic.critic.requires_grad_(False)
-                qs, _ = self.actor_critic.critic(obs, new_actions, training=False)
-                q = torch.minimum(qs[0], qs[1])
-                self.actor_critic.critic.requires_grad_(True)
+                    # Evaluate Q without flowing gradients into critic
+                    self.actor_critic.critic.requires_grad_(False)
+                    qs, _ = self.actor_critic.critic(obs, new_actions, training=False)
+                    q = torch.minimum(qs[0], qs[1])
+                    self.actor_critic.critic.requires_grad_(True)
 
-                alpha = self.log_alpha.exp().detach()
-                actor_loss = (log_probs * alpha - q).mean()
+                    alpha = self.log_alpha.exp().detach()
+                    actor_loss = (log_probs * alpha - q).mean()
 
                 self.actor_optimizer.zero_grad()
-                actor_loss.backward()
-                self.actor_optimizer.step()
+                self._grad_scaler.scale(actor_loss).backward()
+                self._grad_scaler.unscale_(self.actor_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.actor_critic.actor.parameters(), self.max_grad_norm)
+                self._grad_scaler.step(self.actor_optimizer)
                 self._normalize_net(self.actor_critic.actor)
 
                 # ── Step 2: Temperature update (reference formulation) ──
@@ -318,33 +335,40 @@ class FlashSAC:
 
             # ── Step 3: Critic update (uses fresh actor after step 1) ──
             with torch.no_grad():
-                next_actions, info = self.actor_critic.actor(next_obs, training=False)
-                next_log_probs = info["log_prob"]
-                temp_value = self.log_alpha.exp()
-                next_actor_entropy = temp_value * next_log_probs
+                with torch.amp.autocast("cuda", enabled=self._use_amp):
+                    next_actions, info = self.actor_critic.actor(next_obs, training=False)
+                    next_log_probs = info["log_prob"]
+                    temp_value = self.log_alpha.exp()
+                    next_actor_entropy = temp_value * next_log_probs
 
-                obs_all = torch.cat([obs, next_obs], dim=0)
-                act_all = torch.cat([actions, next_actions], dim=0)
-                qs_all, q_infos_all = self.target_critic(obs_all, act_all, training=True)
-                next_qs = qs_all.chunk(2, dim=1)[1]
-                next_q_log_probs = q_infos_all["log_prob"].chunk(2, dim=1)[1]
-                next_q_log_probs = self._select_min_q_log_probs(next_qs, next_q_log_probs)
-                target_probs = self._compute_categorical_td_target(
-                    target_log_probs=next_q_log_probs,
-                    reward=rewards,
-                    done=dones,
-                    actor_entropy=next_actor_entropy,
-                )
+                    obs_all = torch.cat([obs, next_obs], dim=0)
+                    act_all = torch.cat([actions, next_actions], dim=0)
+                    qs_all, q_infos_all = self.target_critic(obs_all, act_all, training=True)
+                    next_qs = qs_all.chunk(2, dim=1)[1]
+                    next_q_log_probs = q_infos_all["log_prob"].chunk(2, dim=1)[1]
+                    next_q_log_probs = self._select_min_q_log_probs(next_qs, next_q_log_probs)
+                    target_probs = self._compute_categorical_td_target(
+                        target_log_probs=next_q_log_probs,
+                        reward=rewards,
+                        done=dones,
+                        actor_entropy=next_actor_entropy,
+                    )
 
-            pred_qs_all, pred_q_infos = self.actor_critic.critic(obs_all, act_all, training=True)
-            pred_log_probs = torch.chunk(pred_q_infos["log_prob"], 2, dim=1)[0]
-            ce_loss = -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1)
-            critic_loss = ce_loss.mean()
+            with torch.amp.autocast("cuda", enabled=self._use_amp):
+                pred_qs_all, pred_q_infos = self.actor_critic.critic(obs_all, act_all, training=True)
+                pred_log_probs = torch.chunk(pred_q_infos["log_prob"], 2, dim=1)[0]
+                ce_loss = -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1)
+                critic_loss = ce_loss.mean()
 
             self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic_optimizer.step()
+            self._grad_scaler.scale(critic_loss).backward()
+            self._grad_scaler.unscale_(self.critic_optimizer)
+            torch.nn.utils.clip_grad_norm_(self.actor_critic.critic.parameters(), self.max_grad_norm)
+            self._grad_scaler.step(self.critic_optimizer)
             self._normalize_net(self.actor_critic.critic)
+
+            # Update scaler once per UTD step
+            self._grad_scaler.update()
 
             # ── Step 4: Target network EMA ──
             with torch.no_grad():
