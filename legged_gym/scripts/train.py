@@ -1,11 +1,10 @@
 import os
-import inspect
 
 
 from legged_gym import *
 from legged_gym.envs import *
 from legged_gym.utils import get_args, task_registry
-import shutil
+from legged_gym.utils.run_archiver import archive_run
 
 def train(args):
     if SIMULATOR == "genesis":
@@ -15,30 +14,14 @@ def train(args):
     # Make environment and algorithm runner
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
-    
-    # Copy env.py and env_config.py to log_dir for backup
+
+    # Archive source code snapshot + resolved config JSON to log_dir
     log_dir = ppo_runner.log_dir
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-    # Derive paths from the actual registered env class file, not from the task name.
-    # This handles tasks like k1_amp_sac that reuse k1_amp's env class.
-    task_class = task_registry.get_task_class(args.task)
-    env_class_file = inspect.getfile(task_class)
-    env_dir = os.path.dirname(env_class_file)
-    env_basename = os.path.splitext(os.path.basename(env_class_file))[0]  # e.g. "k1_amp"
-    robot_config_candidates = [
-        # <task>_config.py in same dir (standard pattern)
-        os.path.join(env_dir, env_basename + "_config.py"),
-        # <task>_sac_config.py etc. – train config matching the task name
-        os.path.join(env_dir, args.task + "_config.py"),
-    ]
-    if os.path.exists(env_class_file):
-        shutil.copy(env_class_file, log_dir)
-    for cfg_path in robot_config_candidates:
-        if os.path.exists(cfg_path):
-            shutil.copy(cfg_path, log_dir)
-            break
-    
+    if log_dir is not None:
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        archive_run(log_dir, env_cfg, train_cfg, task_name=args.task)
+
     # Start training session
     ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
 
