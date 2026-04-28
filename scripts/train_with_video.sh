@@ -2,12 +2,17 @@
 
 set -euo pipefail
 
+# Default simulator – override with --sim <isaacgym|genesis|isaaclab>
+default_sim="isaacgym"
+
 task=""
 recorder_num_steps="200"
 recorder_fps="30"
 recorder_log_level="INFO"
 recorder_fail_fast=""
 display_value="${DISPLAY:-:1}"
+sim_override=""
+num_envs_override=""
 experiment_name_override=""
 run_name_override=""
 train_args=()
@@ -23,6 +28,14 @@ fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --sim)
+            sim_override="$2"
+            shift 2
+            ;;
+        --num_envs)
+            num_envs_override="$2"
+            shift 2
+            ;;
         --task)
             task="$2"
             shift 2
@@ -65,6 +78,56 @@ done
 if [[ -z "$task" ]]; then
     echo "Missing required --task argument" >&2
     exit 1
+fi
+
+# Resolve simulator: CLI flag > env var > default
+SIMULATOR="${sim_override:-${SIMULATOR:-$default_sim}}"
+export SIMULATOR
+echo "[launcher] using simulator: $SIMULATOR"
+
+# ---- activate matching venv -------------------------------------------------
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+case "$SIMULATOR" in
+    isaacgym) venv_dir="$REPO_ROOT/isaacgym_venv" ;;
+    genesis)  venv_dir="$REPO_ROOT/genesis_venv"  ;;
+    isaaclab) venv_dir="$REPO_ROOT/isaaclab_venv" ;;
+    *)
+        echo "[launcher] unknown simulator '$SIMULATOR'" >&2
+        exit 1
+        ;;
+esac
+
+if [[ -f "$venv_dir/bin/activate" ]]; then
+    echo "[launcher] activating venv: $venv_dir"
+    # shellcheck disable=SC1091
+    source "$venv_dir/bin/activate"
+    python_bin="python"
+    # IsaacGym C extensions need libpython3.8.so.1.0 at runtime.
+    if [[ "$SIMULATOR" == "isaacgym" ]]; then
+        py_libdir="$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+        if [[ -n "$py_libdir" ]]; then
+            export LD_LIBRARY_PATH="${py_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            echo "[launcher] LD_LIBRARY_PATH prepended with $py_libdir"
+        fi
+        # Prepend venv nvidia lib dirs so they shadow older system CUDA libs
+        # (e.g. libnvJitLink.so.12 from CUDA 12.0 in /usr/lib would otherwise
+        # shadow the newer pip-installed version needed by PyTorch 2.4.1+cu121).
+        nvidia_libs_path="$(python -c "
+import os, glob, site
+dirs = []
+for sp in site.getsitepackages():
+    for d in glob.glob(os.path.join(sp, 'nvidia', '*', 'lib')):
+        if os.path.isdir(d):
+            dirs.append(d)
+print(':'.join(dirs))
+")"
+        if [[ -n "$nvidia_libs_path" ]]; then
+            export LD_LIBRARY_PATH="${nvidia_libs_path}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            echo "[launcher] LD_LIBRARY_PATH prepended with nvidia venv libs"
+        fi
+    fi
+else
+    echo "[launcher] WARNING: venv not found at $venv_dir — run ./setup_simulator.sh $SIMULATOR first" >&2
 fi
 
 config_line="$({
@@ -110,7 +173,7 @@ print(config.get("num_envs", 4096))
 PY
 } | tail -n 1)"
 default_num_envs="${default_num_envs:-4096}"
-train_num_envs=$(( default_num_envs * 3 ))
+train_num_envs="${num_envs_override:-$default_num_envs}"
 
 experiment_name="$default_experiment_name"
 if [[ -n "$experiment_name_override" ]]; then
@@ -177,7 +240,7 @@ log_launcher "training log: $training_log_file"
 log_launcher "watcher log: $watcher_log_file"
 log_launcher "training output is mirrored to the terminal"
 
-log_launcher "training with num_envs=$train_num_envs (2x default $default_num_envs)"
+log_launcher "training with num_envs=$train_num_envs (config default: $default_num_envs)"
 
 PYTHONUNBUFFERED=1 "$python_bin" -m legged_gym.scripts.train \
     --task "$task" \

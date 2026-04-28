@@ -6,8 +6,8 @@ from rsl_rl.utils.symmetry import compute_symmetric_states_k1
 
 import glob
 
-#MOTION_FILES = glob.glob(LEGGED_GYM_ROOT_DIR + f"/resources/reference_motion/booster_k1/{SIMULATOR}_run/*")
-MOTION_FILES = glob.glob(LEGGED_GYM_ROOT_DIR + f"/resources/reference_motion/worldpose_amass_like_all_tracks_K1_22dof_slim/isaacgym_run/*")
+#MOTION_FILES = glob.glob(LEGGED_GYM_ROOT_DIR + f"/resources/reference_motion/worldpose_amass_like_all_tracks_K1_22dof_slim/isaacgym_run/*")
+MOTION_FILES = glob.glob(LEGGED_GYM_ROOT_DIR + f"/resources/reference_motion/booster_k1/{SIMULATOR}_run/*")
 
 class K1AMPCfg(K1FlatCommonCfg):
     class env(K1FlatCommonCfg.env):
