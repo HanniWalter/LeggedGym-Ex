@@ -130,6 +130,16 @@ else
     echo "[launcher] WARNING: venv not found at $venv_dir — run ./setup_simulator.sh $SIMULATOR first" >&2
 fi
 
+# ---- load wandb API key -----------------------------------------------------
+wandb_key_file="$REPO_ROOT/wandb_key"
+if [[ -f "$wandb_key_file" ]]; then
+    wandb_api_key="$(tr -d '[:space:]' < "$wandb_key_file")"
+    if [[ -n "$wandb_api_key" ]]; then
+        export WANDB_API_KEY="$wandb_api_key"
+        echo "[launcher] loaded WANDB_API_KEY from $wandb_key_file"
+    fi
+fi
+
 config_line="$({
     "$python_bin" - "$task" <<'PY'
 import json
@@ -210,14 +220,28 @@ terminate_pid() {
         return
     fi
 
-    log_launcher "stopping $label (pid=$pid)"
-    kill "$pid" >/dev/null 2>&1 || true
-    for _ in {1..50}; do
+    # Kill the whole process group so IsaacSim child processes (Kit workers,
+    # renderer, etc.) are also terminated. With setsid the pgid == pid.
+    local pgid
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')" || pgid=""
+
+    log_launcher "stopping $label (pid=$pid pgid=${pgid:-?})"
+    if [[ -n "$pgid" && "$pgid" != "0" ]]; then
+        kill -- -"$pgid" >/dev/null 2>&1 || kill "$pid" >/dev/null 2>&1 || true
+    else
+        kill "$pid" >/dev/null 2>&1 || true
+    fi
+    for _ in {1..80}; do
         if ! kill -0 "$pid" >/dev/null 2>&1; then
             return
         fi
         sleep 0.1
     done
+    # Force-kill the group after 8 s if still alive
+    log_launcher "$label did not stop within 8 s — sending SIGKILL to group"
+    if [[ -n "$pgid" && "$pgid" != "0" ]]; then
+        kill -9 -- -"$pgid" >/dev/null 2>&1 || true
+    fi
     kill -9 "$pid" >/dev/null 2>&1 || true
 }
 
@@ -242,7 +266,7 @@ log_launcher "training output is mirrored to the terminal"
 
 log_launcher "training with num_envs=$train_num_envs (config default: $default_num_envs)"
 
-PYTHONUNBUFFERED=1 "$python_bin" -m legged_gym.scripts.train \
+PYTHONUNBUFFERED=1 setsid "$python_bin" -m legged_gym.scripts.train \
     --task "$task" \
     --run_name "$run_name" \
     --experiment_name "$experiment_name" \
@@ -253,7 +277,34 @@ PYTHONUNBUFFERED=1 "$python_bin" -m legged_gym.scripts.train \
 train_pid=$!
 log_launcher "started training pid=$train_pid"
 
-DISPLAY="$display_value" PYTHONUNBUFFERED=1 "$python_bin" -m legged_gym.scripts.record_checkpoints \
+# IsaacLab cannot run two Omniverse Kit instances concurrently: SIGSTOP freezes
+# CPU threads but CUDA/PhysX GPU allocations remain pinned, so the recorder's
+# second Kit instance cannot allocate enough VRAM alongside 4096 training envs
+# on a 12 GB card.  Run the recorder sequentially after training instead.
+if [[ "$SIMULATOR" == "isaaclab" ]]; then
+    log_launcher "isaaclab: watcher will run after training completes (post-training mode — VRAM constraint)"
+
+    if wait "$train_pid"; then
+        train_exit_code=0
+    else
+        train_exit_code=$?
+    fi
+    log_launcher "training exited with code $train_exit_code"
+
+    log_launcher "starting post-training recorder (--no_watch)"
+    PYTHONUNBUFFERED=1 "$python_bin" -m legged_gym.scripts.record_checkpoints \
+        --task "$task" \
+        --log_dir "$run_dir" \
+        --num_steps "$recorder_num_steps" \
+        --fps "$recorder_fps" \
+        --log_level "$recorder_log_level" \
+        --no_watch \
+        $recorder_fail_fast >> "$watcher_log_file" 2>&1
+    log_launcher "post-training recorder finished"
+    exit "$train_exit_code"
+fi
+
+DISPLAY="$display_value" PYTHONUNBUFFERED=1 setsid "$python_bin" -m legged_gym.scripts.record_checkpoints \
     --task "$task" \
     --log_dir "$run_dir" \
     --num_steps "$recorder_num_steps" \

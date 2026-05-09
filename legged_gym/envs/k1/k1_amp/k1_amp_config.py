@@ -105,6 +105,12 @@ class K1AMPCfg(K1FlatCommonCfg):
     class viewer(K1FlatCommonCfg.viewer):
         pos = [1.0, 1.0, 0.5]
 
+    class asset(K1FlatCommonCfg.asset):
+        # K1-AMP trains on flat terrain → self-collision between arms/torso is not
+        # physically relevant and disabling it saves significant GPU time in Genesis.
+        # In IsaacGym this flag is silently ignored (IsaacGym uses bitwise collision filter).
+        self_collisions = 1  # 1 = disabled
+
 class K1AMPCfgPPO(LeggedRobotAMPCfgPPO):
     class policy(LeggedRobotAMPCfgPPO.policy):
         critic_hidden_dims = [1024, 512, 256]

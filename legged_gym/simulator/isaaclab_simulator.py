@@ -21,6 +21,7 @@ class IsaacLabSimulator(Simulator):
     """
     def __init__(self, cfg, sim_params: dict, device, headless):
         self._sim_params = sim_params
+        self._recording_camera = None
         super().__init__(cfg, sim_params, device, headless)
     
     #----- Public methods -----#
@@ -182,7 +183,48 @@ class IsaacLabSimulator(Simulator):
     def set_viewer_camera(self, eye: np.ndarray, target: np.ndarray):
         self._sim.set_camera_view(eye=eye, 
                                   target=target)
-    
+
+    def create_recording_camera(
+        self,
+        width: int,
+        height: int,
+        position: np.ndarray,
+        target: np.ndarray,
+        horizontal_fov_deg: float = None,
+        env_index: int = 0,
+    ):
+        """Creates an offscreen recording camera using omni.replicator."""
+        import omni.replicator.core as rep
+
+        camera = rep.create.camera(
+            position=tuple(float(v) for v in position),
+            look_at=tuple(float(v) for v in target),
+        )
+        render_product = rep.create.render_product(camera, (width, height))
+        annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+        annotator.attach([render_product])
+        self._recording_camera = {
+            "annotator": annotator,
+            "render_product": render_product,
+            "width": width,
+            "height": height,
+        }
+
+    def capture_recording_frame(self) -> np.ndarray:
+        """Steps the replicator render pass and returns an RGB frame (H x W x 3, uint8)."""
+        if self._recording_camera is None:
+            raise RuntimeError("Recording camera is not initialized. Call create_recording_camera() first.")
+        import omni.replicator.core as rep
+
+        rep.orchestrator.step(pause_timeline=False)
+        data = self._recording_camera["annotator"].get_data()
+        if data is None or data.size == 0:
+            return np.zeros(
+                (self._recording_camera["height"], self._recording_camera["width"], 3),
+                dtype=np.uint8,
+            )
+        return np.asarray(data[:, :, :3], dtype=np.uint8).copy()
+
     #----- Protected methods -----#
     def _pre_simulator_step(self, actions):
         # apply action delay by using an action queue
@@ -201,7 +243,10 @@ class IsaacLabSimulator(Simulator):
             self._frame_count = 0
             
     def _create_sim(self):
-        self._app_launcher = AppLauncher({"headless": self._headless, "device": self._device})
+        launcher_cfg = {"headless": self._headless, "device": self._device}
+        if getattr(self._cfg.viewer, "offscreen_render", False):
+            launcher_cfg["enable_cameras"] = True
+        self._app_launcher = AppLauncher(launcher_cfg)
         
         import isaaclab.sim as sim_utils
         from isaacsim.core.utils.stage import get_current_stage

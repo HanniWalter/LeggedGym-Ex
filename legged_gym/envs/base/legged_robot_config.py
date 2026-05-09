@@ -253,6 +253,9 @@ class LeggedRobotCfg(BaseConfig):
         lookat: List[float] = [0.0, 0.0, 0.0]  # [m], relative to the robot position
         offscreen_render: bool = False
         rendered_envs_idx: List[int] = [i for i in range(5)]  # [Genesis] number of environments to be rendered, if not headless
+        # Recording camera config for Genesis (must be set before scene.build()).
+        # Dict with keys: width, height, position (list[3]), target (list[3]), fov (float, optional).
+        recording_camera = None
     
     # sensor configuration:
     class sensor:
@@ -284,6 +287,16 @@ class LeggedRobotCfg(BaseConfig):
         # For Genesis
         max_collision_pairs = 100  # More collision pairs will occupy more GPU memory and slow down the simulation
         IK_max_targets = 2         # Fewer IK targets will lead to fewer memory usage
+        # Constraint solver: "Newton" (default, faster + accurate for legged tasks
+        # in this project — empirically beats CG by ~30 % on k1_amp/4096 envs)
+        # or "CG" (alternative, may be faster on simpler scenes).
+        genesis_constraint_solver: str = "Newton"
+        # Newton constraint solver iterations (default 50).
+        # Reducing to 15-20 can cut scene.step() time by ~30% with minimal physics degradation
+        # for flat-terrain locomotion tasks. Tune up if contacts become unstable.
+        genesis_solver_iterations: int = 50
+        # Line-search iterations within Newton (default 50). Same tradeoff.
+        genesis_ls_iterations: int = 50
         # For IsaacGym
         gravity: List[float] = [0.0, 0.0, -9.81]  # [m/s^2]
         up_axis: int = 1  # 0 is y, 1 is z

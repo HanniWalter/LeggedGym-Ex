@@ -271,7 +271,10 @@ class CTS_AMP_Runner(OnPolicyRunner):
             }, path)
     
     def load(self, path, load_optimizer=True):
-        loaded_dict = torch.load(path)
+        try:
+            loaded_dict = torch.load(path, weights_only=False)
+        except TypeError:
+            loaded_dict = torch.load(path)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
         self.alg.discriminator.load_state_dict(loaded_dict['discriminator_state_dict'])
         self.alg.amp_normalizer = loaded_dict['amp_normalizer']

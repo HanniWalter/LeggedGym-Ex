@@ -553,7 +553,10 @@ class OnPolicyRunner:
         Returns:
             Optional infos dict stored in the checkpoint.
         """
-        loaded_dict = torch.load(path)
+        try:
+            loaded_dict = torch.load(path, weights_only=False)
+        except TypeError:
+            loaded_dict = torch.load(path)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])

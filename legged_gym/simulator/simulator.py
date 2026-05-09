@@ -115,7 +115,24 @@ class Simulator(ABC):
             target (np.ndarray): The target point the camera is looking at.
         """
         return
-    
+
+    def create_recording_camera(
+        self,
+        width: int,
+        height: int,
+        position: np.ndarray,
+        target: np.ndarray,
+        horizontal_fov_deg: float = None,
+        env_index: int = 0,
+    ):
+        """Creates an offscreen recording camera. Override in subclasses that support it."""
+        raise NotImplementedError(f"{type(self).__name__} does not support create_recording_camera().")
+
+    def capture_recording_frame(self) -> np.ndarray:
+        """Renders the recording camera and returns an RGB numpy array (H x W x 3, uint8).
+        Override in subclasses that support it."""
+        raise NotImplementedError(f"{type(self).__name__} does not support capture_recording_frame().")
+
     @abstractmethod
     def update_sensors(self):
         """Updates the sensor readings, such as depth image sensors and lidar sensors.

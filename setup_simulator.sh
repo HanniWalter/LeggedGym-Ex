@@ -206,7 +206,8 @@ install_genesis() {
         --index-url https://download.pytorch.org/whl/cu126
 
     log "Installing LeggedGym-Ex with [genesis] extras"
-    pip install -e "$REPO_ROOT[genesis]"
+    pip install -e "$REPO_ROOT[genesis]" \
+        --extra-index-url https://download.pytorch.org/whl/cu126
 
     deactivate
     log "Genesis venv ready: $venv_dir"

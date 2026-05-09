@@ -13,6 +13,8 @@ if SIMULATOR == "genesis":
 class GenesisSimulator(Simulator):
     def __init__(self, cfg, sim_params: dict, device, headless):
         self._sim_params = sim_params
+        self._recording_camera = None
+        self._recording_camera_size = None
         super().__init__(cfg, sim_params, device, headless)
     
     #----- Public methods -----#
@@ -27,33 +29,54 @@ class GenesisSimulator(Simulator):
             self._robot.control_dofs_force(
                 self._torques, self._dof_indices)
             self._scene.step()
-            self._dof_pos[:] = self._robot.get_dofs_position(
-                self._dof_indices)
-            self._dof_vel[:] = self._robot.get_dofs_velocity(
-                self._dof_indices)
+            self._dof_pos[:] = self._sv_dofs_pos[:, self._gi_dofs]
+            self._dof_vel[:] = self._sv_dofs_vel[:, self._gi_dofs]
 
     def post_physics_step(self):
-        # prepare quantities
-        self._base_pos[:] = self._robot.get_pos()
-        self._check_base_pos_out_of_bound()       # check if the pos of the robot is out of terrain bounds
-        self._base_pos[:] = self._robot.get_pos()
-        self._base_quat_gs[:] = self._robot.get_quat()
-        self._base_quat[:,-1] = self._robot.get_quat()[:,0]   # wxyz to xyzw
-        self._base_quat[:,:3] = self._robot.get_quat()[:,1:4] # wxyz to xyzw
+        # Read all state from persistent zero-copy DLPack views — no kernel dispatch,
+        # no tensor allocation.  Views auto-update after every scene.step() call.
+
+        # Base position
+        self._base_pos[:] = self._sv_links_pos[:, self._gi_base_link, :]
+        self._check_base_pos_out_of_bound()       # may overwrite _base_pos[env_ids] in-place
+
+        # Quaternion: view at base link (wxyz), reorder to xyzw for legged_gym convention
+        _quat_wxyz = self._sv_links_quat[:, self._gi_base_link, :]
+        self._base_quat_gs[:] = _quat_wxyz
+        self._base_quat[:, :3] = _quat_wxyz[:, 1:4]
+        self._base_quat[:, 3]  = _quat_wxyz[:, 0]
         self._base_euler[:] = get_euler_xyz(self._base_quat)
-        self._base_lin_vel[:] = quat_rotate_inverse(self._base_quat, self._robot.get_vel())
-        self._base_ang_vel[:] = quat_rotate_inverse(self._base_quat, self._robot.get_ang())
+
+        # Base linear / angular velocity via composite-velocity formula:
+        #   v_link_origin = cd_vel + cd_ang × (pos - root_COM)
+        _base_cd_vel = self._sv_links_cd_vel[:, self._gi_base_link, :]
+        _base_cd_ang = self._sv_links_cd_ang[:, self._gi_base_link, :]
+        _base_delta  = (self._sv_links_pos[:, self._gi_base_link, :]
+                        - self._sv_links_root_COM[:, self._gi_base_link, :])
+        _base_vel_world = _base_cd_vel + _base_cd_ang.cross(_base_delta, dim=-1)
+        self._base_lin_vel[:] = quat_rotate_inverse(self._base_quat, _base_vel_world)
+        self._base_ang_vel[:] = quat_rotate_inverse(self._base_quat, _base_cd_ang)
         self._projected_gravity = quat_rotate_inverse(self._base_quat, self._global_gravity)
-        self._dof_pos[:] = self._robot.get_dofs_position(self._dof_indices)
-        self._dof_vel[:] = self._robot.get_dofs_velocity(self._dof_indices)
-        self._link_contact_forces[:] = self._robot.get_links_net_contact_force()
-        self._feet_pos[:] = self._robot.get_links_pos()[:, self._feet_indices, :]
-        self._feet_vel[:] = self._robot.get_links_vel()[:, self._feet_indices, :]
-        self._key_body_pos[:] = self._robot.get_links_pos()[:, self._key_body_indices, :]
+
+        # dof_pos/vel are already up-to-date from the substep loop in step();
+        # avoid redundant Taichi fetches here.
+
+        # Contact forces — contiguous robot link slice → genuine zero-copy view
+        self._link_contact_forces[:] = self._sv_links_contact_force[:, self._gi_all_links, :]
+
+        # Foot & key-body positions / velocities from the persistent view
+        _feet_cd_vel = self._sv_links_cd_vel[:, self._feet_indices_tensor, :]
+        _feet_cd_ang = self._sv_links_cd_ang[:, self._feet_indices_tensor, :]
+        _feet_delta  = (self._sv_links_pos[:, self._feet_indices_tensor, :]
+                        - self._sv_links_root_COM[:, self._feet_indices_tensor, :])
+        self._feet_pos[:] = self._sv_links_pos[:, self._feet_indices_tensor, :]
+        self._feet_vel[:] = _feet_cd_vel + _feet_cd_ang.cross(_feet_delta, dim=-1)
+        self._key_body_pos[:] = self._sv_links_pos[:, self._key_body_indices_tensor, :]
+
         # Link contact state
         if self._cfg.asset.obtain_link_contact_states:
             self._link_contact_states = 1. * (torch.norm(
-                self._link_contact_forces[:, self._contact_state_link_indices, :], dim=-1) > 1.)
+                self._link_contact_forces[:, self._contact_state_link_indices_tensor, :], dim=-1) > 1.)
         # update terrain heights info
         if self._cfg.terrain.measure_heights:
             self._update_surrounding_heights()
@@ -166,10 +189,12 @@ class GenesisSimulator(Simulator):
         # apply random forces to the links of the robot
         push_force = torch.rand((self._num_envs, self._robot.n_links, 3), 
                                 device=self._device) * 2 * max_force - max_force
-        all_link_idx = [link.idx - self._robot.link_start for link in self._robot.links]
+        # Cache the link index list — it is invariant after build.
+        if not hasattr(self, "_all_link_idx"):
+            self._all_link_idx = [link.idx - self._robot.link_start for link in self._robot.links]
         self._scene.sim.rigid_solver.apply_links_external_force(
             push_force,
-            links_idx=all_link_idx
+            links_idx=self._all_link_idx
         )
 
     def draw_debug_vis(self,
@@ -232,8 +257,113 @@ class GenesisSimulator(Simulator):
 
     def set_viewer_camera(self, eye: np.ndarray, target: np.ndarray):
         self._scene.viewer.set_camera_pose(pos=eye, lookat=target)
-    
+
+    def create_recording_camera(
+        self,
+        width: int,
+        height: int,
+        position: np.ndarray,
+        target: np.ndarray,
+        horizontal_fov_deg: float = None,
+        env_index: int = 0,
+    ):
+        """Creates a free-floating recording camera in the Genesis scene.
+
+        Can be called after scene.build(). The camera is added via scene.add_camera()
+        which does not require a rebuild.
+        """
+        fov = horizontal_fov_deg if horizontal_fov_deg is not None else 60
+        self._recording_camera = self._scene.add_camera(
+            res=(width, height),
+            pos=tuple(float(v) for v in position),
+            lookat=tuple(float(v) for v in target),
+            fov=fov,
+            GUI=False,
+        )
+        self._recording_camera_size = (width, height)
+
+    def capture_recording_frame(self) -> np.ndarray:
+        """Renders the recording camera and returns an RGB numpy array (H x W x 3, uint8)."""
+        if self._recording_camera is None:
+            raise RuntimeError("Recording camera is not initialized. Call create_recording_camera() first.")
+        rgb_arr, _, _, _ = self._recording_camera.render(rgb=True)
+        return np.asarray(rgb_arr, dtype=np.uint8)
+
     #----- Protected methods -----#
+    def _setup_state_views(self):
+        """Create persistent zero-copy DLPack views of Genesis Taichi state fields.
+
+        Called once after scene.build(). The returned tensors share GPU memory with
+        the Taichi solver and auto-update after every scene.step() call — no clone().
+
+        Views (all shape (n_envs, n_links_total, 3) or (n_envs, n_dofs_total)):
+            _sv_links_pos         link origin positions (world frame)
+            _sv_links_quat        link orientations (wxyz)
+            _sv_links_cd_vel      link composite linear velocity (root COM frame)
+            _sv_links_cd_ang      link composite angular velocity
+            _sv_links_root_COM    kinematic tree COM (used for velocity computation)
+            _sv_links_contact_force  net contact force per link
+            _sv_dofs_pos          DOF positions (includes free-joint DOFs)
+            _sv_dofs_vel          DOF velocities
+
+        Global index pre-computations stored:
+            _gi_base_link     int   scene-global index of the robot base link
+            _gi_feet          list  scene-global indices of foot links
+            _gi_key_bodies    list  scene-global indices of key-body links
+            _gi_all_links     slice scene-global slice of all robot links (contiguous)
+            _gi_dofs          list/slice  scene-global DOF indices for motor joints
+        """
+        from genesis.utils.misc import qd_to_torch as _gs_to_torch
+        _sol = self._scene.sim.rigid_solver
+
+        # Link state persistent views — shape (n_envs, n_links_total, 3/4)
+        self._sv_links_pos           = _gs_to_torch(_sol.links_state.pos,           transpose=True, copy=False)
+        self._sv_links_quat          = _gs_to_torch(_sol.links_state.quat,          transpose=True, copy=False)
+        self._sv_links_cd_vel        = _gs_to_torch(_sol.links_state.cd_vel,        transpose=True, copy=False)
+        self._sv_links_cd_ang        = _gs_to_torch(_sol.links_state.cd_ang,        transpose=True, copy=False)
+        self._sv_links_root_COM      = _gs_to_torch(_sol.links_state.root_COM,      transpose=True, copy=False)
+        self._sv_links_contact_force = _gs_to_torch(_sol.links_state.contact_force, transpose=True, copy=False)
+
+        # DOF state persistent views — shape (n_envs, n_dofs_total)
+        self._sv_dofs_pos = _gs_to_torch(_sol.dofs_state.pos, transpose=True, copy=False)
+        self._sv_dofs_vel = _gs_to_torch(_sol.dofs_state.vel, transpose=True, copy=False)
+
+        # Scene-global link indices
+        lstart = self._robot.link_start
+        self._gi_base_link  = self._robot.base_link_idx              # already scene-global
+        self._gi_feet       = [lstart + fi for fi in self._feet_indices]
+        self._gi_key_bodies = [lstart + ki for ki in self._key_body_indices]
+        self._gi_all_links  = slice(lstart, self._robot.link_end)    # contiguous → true view
+
+        # Scene-global DOF indices for motor joints.
+        # joint.dof_start is scene-global (see RigidJoint.dof_start docstring).
+        # For single-robot setups _dof_start=0 so local==global; kept explicit for safety.
+        _dof_start_off = getattr(self._robot, '_dof_start', 0)
+        raw = [_dof_start_off + di for di in self._dof_indices] if _dof_start_off else self._dof_indices
+        # Use a contiguous slice when possible (avoids fancy indexing overhead)
+        if raw and raw == list(range(raw[0], raw[0] + len(raw))):
+            self._gi_dofs = slice(raw[0], raw[0] + len(raw))
+        else:
+            self._gi_dofs = raw
+
+        print(f"[Genesis] State views registered — base_link={self._gi_base_link}, "
+              f"n_links_total={_sol.n_links}, n_dofs_total={_sol.n_dofs}, "
+              f"dof_slice={self._gi_dofs}")
+
+    def _resolve_constraint_solver(self):
+        """Pick the Genesis constraint solver based on cfg.sim.genesis_constraint_solver.
+
+        Falls back to Newton if the requested solver name is unknown.
+        """
+        name = getattr(self._cfg.sim, "genesis_constraint_solver", "Newton")
+        solver = getattr(gs.constraint_solver, name, None)
+        if solver is None:
+            print(f"[Genesis] Unknown constraint_solver '{name}', falling back to Newton.")
+            solver = gs.constraint_solver.Newton
+        else:
+            print(f"[Genesis] Using constraint_solver: {name}")
+        return solver
+
     def _pre_simulator_step(self, actions):
         # apply action delay by using an action queue
         if self._cfg.domain_rand.randomize_ctrl_delay:
@@ -271,11 +401,14 @@ class GenesisSimulator(Simulator):
                 ),
             rigid_options=gs.options.RigidOptions(
                 dt=self._sim_params["dt"],
-                constraint_solver=gs.constraint_solver.Newton,
+                constraint_solver=self._resolve_constraint_solver(),
+                iterations=getattr(self._cfg.sim, "genesis_solver_iterations", 50),
+                ls_iterations=getattr(self._cfg.sim, "genesis_ls_iterations", 50),
                 enable_collision=True,
                 enable_joint_limit=True,
                 enable_self_collision=not self._cfg.asset.self_collisions,
                 max_collision_pairs=self._cfg.sim.max_collision_pairs,
+                use_contact_island=getattr(self._cfg.sim, "genesis_use_contact_island", False),
                 IK_max_targets=self._cfg.sim.IK_max_targets,
                 batch_dofs_info=self._batch_dofs_links_info,
                 batch_links_info=self._batch_dofs_links_info,
@@ -314,14 +447,31 @@ class GenesisSimulator(Simulator):
                 self._cfg.terrain.num_cols * self._cfg.terrain.terrain_width - 1.0
         elif self._cfg.terrain.mesh_type == 'plane':  # the plane used has limited size,
             # and the origin of the world is at the center of the plane
-            self._terrain_x_range[0] = -self._cfg.terrain.plane_length/2+1
-            self._terrain_x_range[1] = self._cfg.terrain.plane_length/2-1
-            # the plane is a square
-            self._terrain_y_range[0] = -self._cfg.terrain.plane_length/2+1
-            self._terrain_y_range[1] = self._cfg.terrain.plane_length/2-1
+            if self._cfg.terrain.plane_length == 0.0:
+                # plane_length=0 means no boundary restriction (e.g. recording mode)
+                self._terrain_x_range[0] = -1e6
+                self._terrain_x_range[1] = 1e6
+                self._terrain_y_range[0] = -1e6
+                self._terrain_y_range[1] = 1e6
+            else:
+                self._terrain_x_range[0] = -self._cfg.terrain.plane_length/2+1
+                self._terrain_x_range[1] = self._cfg.terrain.plane_length/2-1
+                # the plane is a square
+                self._terrain_y_range[0] = -self._cfg.terrain.plane_length/2+1
+                self._terrain_y_range[1] = self._cfg.terrain.plane_length/2-1
+
+        # Decide once whether the per-step bounds check can be skipped:
+        # only if the bounds are effectively unbounded (>=1e5 m).
+        self._skip_bounds_check = (
+            self._terrain_x_range[1].item() >= 1e5
+            and self._terrain_y_range[1].item() >= 1e5
+        )
+        if self._skip_bounds_check:
+            print("[Genesis] Bounds effectively unbounded — skipping per-step base-pos bounds check.")
 
     def _create_envs(self):
-        # Create envs
+        create_envs_bar = tqdm(total=3, desc="Loading Envs", unit="step", leave=True)
+        # Create envs - prefer MJCF (xml) when provided, else fall back to URDF
         if self._cfg.asset.xml_file != "":
             asset_path = self._cfg.asset.xml_file.format(
                 LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
@@ -335,15 +485,48 @@ class GenesisSimulator(Simulator):
                     quat=np.array([1.0, 0.0, 0.0, 0.0]),  # wxyz
                 )
             )
+            create_envs_bar.update(1)
+        elif getattr(self._cfg.asset, "file", "") != "":
+            asset_path = self._cfg.asset.file.format(
+                LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
+            asset_root = os.path.dirname(asset_path)
+            asset_file = os.path.basename(asset_path)
+
+            self._robot = self._scene.add_entity(
+                gs.morphs.URDF(
+                    file=os.path.join(asset_root, asset_file),
+                    pos=np.array(self._cfg.init_state.pos),
+                    quat=np.array([1.0, 0.0, 0.0, 0.0]),  # wxyz
+                    fixed=False,
+                )
+            )
+            create_envs_bar.update(1)
         else:
-            raise NotImplementedError("Please specify xml file path for Genesis simulator!")
+            create_envs_bar.close()
+            raise NotImplementedError("Please specify xml or urdf file path for Genesis simulator!")
         
         # add camera if needed
         if self._cfg.sensor.add_depth:
             self._setup_depth_camera()
         
-        # build
+        # Add recording camera before build if requested via config.
+        # Genesis requires cameras to be registered before scene.build().
+        _rc_cfg = getattr(self._cfg.viewer, 'recording_camera', None)
+        if _rc_cfg is not None:
+            self._recording_camera = self._scene.add_camera(
+                res=(_rc_cfg['width'], _rc_cfg['height']),
+                pos=tuple(float(v) for v in _rc_cfg['position']),
+                lookat=tuple(float(v) for v in _rc_cfg['target']),
+                fov=_rc_cfg.get('fov', 60),
+                GUI=False,
+            )
+            self._recording_camera_size = (_rc_cfg['width'], _rc_cfg['height'])
+
+        # build — compiles Taichi kernels on first run, may take several minutes
+        print(f"[Genesis] Building scene with {self._num_envs} envs — compiling Taichi kernels on first run, please wait...")
         self._scene.build(n_envs=self._num_envs)
+        print("[Genesis] Scene build complete.")
+        create_envs_bar.update(1)
 
         self._get_env_origins()
 
@@ -354,6 +537,8 @@ class GenesisSimulator(Simulator):
         self._dof_indices = [self._robot.get_joint(
             name).dof_start for name in self._cfg.asset.dof_names]
         print(f"motor dof indices: {self._dof_indices}")
+        # LongTensor version for use after scene.build()
+        self._dof_indices_tensor = None  # set in _init_buffers after build
         
         # find indices of links specified in the config
         def find_link_indices(names):
@@ -532,7 +717,23 @@ class GenesisSimulator(Simulator):
 
         self._init_height_points()
         self._measured_heights = torch.zeros(self._num_envs, self._num_height_points, device=self._device, requires_grad=False)
-    
+
+        # Register zero-copy DLPack views of the Taichi state fields.
+        # Must be called after scene.build() (inside _create_envs) has run.
+        # This also sets _gi_feet and _gi_key_bodies used below.
+        self._setup_state_views()
+
+        # Convert Python-list indices to GPU LongTensors for zero-copy advanced indexing.
+        self._dof_indices_tensor = torch.tensor(
+            self._dof_indices, dtype=torch.long, device=self._device)
+        self._feet_indices_tensor = torch.tensor(
+            self._gi_feet, dtype=torch.long, device=self._device)
+        self._key_body_indices_tensor = torch.tensor(
+            self._gi_key_bodies, dtype=torch.long, device=self._device)
+        if hasattr(self, '_contact_state_link_indices'):
+            self._contact_state_link_indices_tensor = torch.tensor(
+                self._contact_state_link_indices, dtype=torch.long, device=self._device)
+
     def _init_height_points(self):
         y = torch.tensor(self._cfg.terrain.measured_points_y,
                          device=self._device, requires_grad=False)
@@ -658,6 +859,11 @@ class GenesisSimulator(Simulator):
     def _check_base_pos_out_of_bound(self):
         """ Check if the base position is out of the terrain bounds
         """
+        # Fast path: when the configured bounds are effectively unbounded
+        # (e.g. plane terrain with plane_length=0 — recording / no-bound mode)
+        # skip the per-step gather + nonzero entirely.
+        if getattr(self, "_skip_bounds_check", False):
+            return
         x_out_of_bound = (self._base_pos[:, 0] >= self._terrain_x_range[1]) | (
             self._base_pos[:, 0] <= self._terrain_x_range[0])
         y_out_of_bound = (self._base_pos[:, 1] >= self._terrain_y_range[1]) | (

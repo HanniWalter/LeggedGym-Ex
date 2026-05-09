@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -18,11 +19,47 @@ import torch
 
 from legged_gym import PROJECT_ROOT_DIR, SIMULATOR
 from legged_gym.envs import *
-from legged_gym.simulator.isaacgym_simulator import IsaacGymSimulator
 from legged_gym.utils import task_registry
+
+if SIMULATOR == "isaacgym":
+    from legged_gym.simulator.isaacgym_simulator import IsaacGymSimulator
+else:
+    IsaacGymSimulator = None
 
 
 CHECKPOINT_RE = re.compile(r"model_(\d+)\.pt$")
+
+
+def _pause_training(train_pid: int, logger: "RecorderLogger") -> None:
+    """Send SIGSTOP to the training process group to suspend it during recording."""
+    if not train_pid:
+        return
+    try:
+        pgid = os.getpgid(train_pid)
+        os.killpg(pgid, signal.SIGSTOP)
+        logger.event(
+            "training_paused",
+            message=f"Sent SIGSTOP to training process group (pid={train_pid}, pgid={pgid})",
+            train_pid=train_pid,
+        )
+    except (ProcessLookupError, PermissionError):
+        pass  # training already exited
+
+
+def _resume_training(train_pid: int, logger: "RecorderLogger") -> None:
+    """Send SIGCONT to the training process group to resume it after recording."""
+    if not train_pid:
+        return
+    try:
+        pgid = os.getpgid(train_pid)
+        os.killpg(pgid, signal.SIGCONT)
+        logger.event(
+            "training_resumed",
+            message=f"Sent SIGCONT to training process group (pid={train_pid}, pgid={pgid})",
+            train_pid=train_pid,
+        )
+    except (ProcessLookupError, PermissionError):
+        pass  # training already exited
 
 
 def parse_args():
@@ -43,6 +80,25 @@ def parse_args():
     parser.add_argument("--camera_lookat", nargs=3, type=float, default=[0.0, 0.0, 0.5], help="World-space camera look-at point.")
     parser.add_argument("--max_retries", type=int, default=3, help="Maximum retries per checkpoint.")
     parser.add_argument("--retry_backoff", type=float, default=1.0, help="Initial retry backoff in seconds.")
+    parser.add_argument(
+        "--no_watch",
+        action="store_true",
+        default=False,
+        help=(
+            "Process all existing checkpoints once and exit instead of watching for new ones. "
+            "Used for simulators (e.g. isaaclab) that cannot run two Kit instances concurrently with training."
+        ),
+    )
+    parser.add_argument(
+        "--train_pid",
+        type=int,
+        default=0,
+        help=(
+            "PID of the training process. When set, the recorder sends SIGSTOP to this process "
+            "before initializing its Kit instance and SIGCONT after recording completes, so that "
+            "only one Omniverse Kit instance is active at a time."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -80,7 +136,9 @@ def make_runtime_args(task: str, cpu: bool) -> SimpleNamespace:
 def override_configs_for_recording(env_cfg, task_type: str):
     env_cfg.env.num_envs = 1
     env_cfg.viewer.rendered_envs_idx = [0]
-    env_cfg.viewer.offscreen_render = True
+    # offscreen_render is an IsaacGym/IsaacLab viewer flag; skip for other simulators
+    if SIMULATOR in {"isaacgym", "isaaclab"}:
+        env_cfg.viewer.offscreen_render = True
     env_cfg.env.debug = False
     env_cfg.env.debug_draw_height_points_around_base = False
     env_cfg.env.debug_draw_height_points_around_feet = False
@@ -96,6 +154,12 @@ def override_configs_for_recording(env_cfg, task_type: str):
     env_cfg.terrain.curriculum = False
     env_cfg.terrain.selected = False
     env_cfg.terrain.measure_heights = False
+    # IsaacGym places env origins at (spacing*row, spacing*col) — with 1 env this is (0, 0).
+    # Genesis places env origins at (spacing*row - plane_length/4, spacing*col - plane_length/4)
+    # — with default plane_length=200 this is (-50, -50), far outside the camera FOV.
+    # Setting plane_length=0 and env_spacing=0 makes both simulators spawn at (0, 0).
+    env_cfg.terrain.plane_length = 0.0
+    env_cfg.env.env_spacing = 0.0
 
     env_cfg.commands.zero_cmd_prob = 0.0
     env_cfg.commands.heading_command = False
@@ -286,6 +350,7 @@ class RecorderRuntime:
         self.policy = None
         self.run_dir = None
         self.last_processed_checkpoint = None
+        self._genesis_initialized = False
 
     def set_run_dir(self, run_dir: Path):
         self.run_dir = run_dir
@@ -301,11 +366,30 @@ class RecorderRuntime:
     def ensure_runtime(self):
         if self.env is not None:
             return
+        # Genesis must be initialized before any Genesis objects are created.
+        # Only call gs.init() once per process — it cannot be called a second time.
+        if SIMULATOR == "genesis" and not self._genesis_initialized:
+            import genesis as gs
+            gs.init(
+                backend=gs.cpu if self.args.cpu else gs.gpu,
+                logging_level='warning',
+            )
+            self._genesis_initialized = True
         # Free any stale CUDA memory before creating a new environment.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         env_cfg, train_cfg = task_registry.get_cfgs(name=self.args.task)
         override_configs_for_recording(env_cfg, self.task_type)
+        # For Genesis, the recording camera must be registered before scene.build().
+        # Pass camera params via env_cfg.viewer.recording_camera so genesis_simulator
+        # adds the camera pre-build.
+        if SIMULATOR == "genesis":
+            env_cfg.viewer.recording_camera = {
+                'width': self.args.camera_width,
+                'height': self.args.camera_height,
+                'position': list(self.args.camera_pos),
+                'target': list(self.args.camera_lookat),
+            }
         # Reduce AMP runner memory: limit motion files and preload transitions.
         if hasattr(train_cfg.runner, 'amp_motion_files') and train_cfg.runner.amp_motion_files:
             train_cfg.runner.amp_motion_files = train_cfg.runner.amp_motion_files[:1]
@@ -323,16 +407,18 @@ class RecorderRuntime:
             train_cfg=train_cfg,
             log_root=None,
         )
-        if not isinstance(env.simulator, IsaacGymSimulator):
-            raise RuntimeError("record_checkpoints.py currently supports IsaacGym only.")
-        env.simulator.create_recording_camera(
-            width=self.args.camera_width,
-            height=self.args.camera_height,
-            position=np.asarray(self.args.camera_pos, dtype=np.float32),
-            target=np.asarray(self.args.camera_lookat, dtype=np.float32),
-            env_index=0,
-        )
-        # Warmup: reset and capture a throwaway frame to prime the IsaacGym
+        if not hasattr(env.simulator, 'capture_recording_frame'):
+            raise RuntimeError(f"{type(env.simulator).__name__} does not support recording cameras.")
+        # For IsaacGym, camera is still created post-build (IsaacGym supports this).
+        if SIMULATOR != "genesis":
+            env.simulator.create_recording_camera(
+                width=self.args.camera_width,
+                height=self.args.camera_height,
+                position=np.asarray(self.args.camera_pos, dtype=np.float32),
+                target=np.asarray(self.args.camera_lookat, dtype=np.float32),
+                env_index=0,
+            )
+        # Warmup: reset and capture a throwaway frame to prime the
         # rendering pipeline before the first real recording.
         env.reset()
         env.simulator.capture_recording_frame()
@@ -605,39 +691,13 @@ def process_checkpoint(runtime: RecorderRuntime, status_store: StatusStore, logg
     final_video_path = checkpoint_info["video_path"]
     last_error_message = None
 
-    for attempt in range(1, runtime.args.max_retries + 1):
-        status_store.update(
-            key,
-            status="recording",
-            checkpoint_path=str(checkpoint_info["checkpoint_path"]),
-            video_path=str(final_video_path),
-            attempts=attempt,
-            last_attempt_ts=time.time(),
-            error_message=None,
-        )
-        logger.event(
-            "recording_started",
-            message=f"Recording checkpoint {checkpoint_info['iteration']} (attempt {attempt}/{runtime.args.max_retries})",
-            checkpoint_path=str(checkpoint_info["checkpoint_path"]),
-            iteration=checkpoint_info["iteration"],
-            attempt=attempt,
-        )
-        started_at = time.perf_counter()
-        try:
-            runtime.ensure_runtime()
-            if not final_video_path.exists():
-                record_video(runtime, checkpoint_info)
-                logger.event(
-                    "recording_done",
-                    message=f"Recorded checkpoint {checkpoint_info['iteration']} to {final_video_path}",
-                    checkpoint_path=str(checkpoint_info["checkpoint_path"]),
-                    video_path=str(final_video_path),
-                    iteration=checkpoint_info["iteration"],
-                    elapsed_s=time.perf_counter() - started_at,
-                )
+    train_pid = getattr(runtime.args, "train_pid", 0)
+    _pause_training(train_pid, logger)
+    try:
+        for attempt in range(1, runtime.args.max_retries + 1):
             status_store.update(
                 key,
-                status="recorded",
+                status="recording",
                 checkpoint_path=str(checkpoint_info["checkpoint_path"]),
                 video_path=str(final_video_path),
                 attempts=attempt,
@@ -645,89 +705,134 @@ def process_checkpoint(runtime: RecorderRuntime, status_store: StatusStore, logg
                 error_message=None,
             )
             logger.event(
-                "recording_ready",
-                message=f"Recorded video for checkpoint {checkpoint_info['iteration']}",
-                checkpoint_path=str(checkpoint_info["checkpoint_path"]),
-                video_path=str(final_video_path),
-                iteration=checkpoint_info["iteration"],
-                elapsed_s=time.perf_counter() - started_at,
-            )
-            runtime.last_processed_checkpoint = str(checkpoint_info["checkpoint_path"])
-            return
-        except Exception as exc:
-            last_error_message = str(exc)
-            logger.event(
-                "checkpoint_failed",
-                level="ERROR",
-                message=f"Checkpoint {checkpoint_info['iteration']} failed on attempt {attempt}: {exc}",
+                "recording_started",
+                message=f"Recording checkpoint {checkpoint_info['iteration']} (attempt {attempt}/{runtime.args.max_retries})",
                 checkpoint_path=str(checkpoint_info["checkpoint_path"]),
                 iteration=checkpoint_info["iteration"],
                 attempt=attempt,
-                elapsed_s=time.perf_counter() - started_at,
-                traceback=traceback.format_exc(),
             )
-
-            # Detect unrecoverable errors: once IsaacGym's PhysX Foundation
-            # is created it cannot be re-created in the same process.
-            is_oom = "CUDA out of memory" in str(exc) or "OutOfMemoryError" in type(exc).__name__
-            is_physx_stuck = "Foundation object exists already" in str(exc)
-            unrecoverable = is_physx_stuck and runtime.env is None
-
-            if is_oom:
-                runtime.destroy_runtime()
-
-            if unrecoverable or attempt >= runtime.args.max_retries:
+            started_at = time.perf_counter()
+            try:
+                runtime.ensure_runtime()
+                if not final_video_path.exists():
+                    record_video(runtime, checkpoint_info)
+                    logger.event(
+                        "recording_done",
+                        message=f"Recorded checkpoint {checkpoint_info['iteration']} to {final_video_path}",
+                        checkpoint_path=str(checkpoint_info["checkpoint_path"]),
+                        video_path=str(final_video_path),
+                        iteration=checkpoint_info["iteration"],
+                        elapsed_s=time.perf_counter() - started_at,
+                    )
                 status_store.update(
                     key,
-                    status="failed",
+                    status="recorded",
                     checkpoint_path=str(checkpoint_info["checkpoint_path"]),
                     video_path=str(final_video_path),
                     attempts=attempt,
                     last_attempt_ts=time.time(),
-                    error_message=last_error_message,
+                    error_message=None,
                 )
-                if unrecoverable:
-                    logger.event(
-                        "runtime_unrecoverable",
-                        level="ERROR",
-                        message=(
-                            "PhysX Foundation cannot be re-created in this process. "
-                            "This usually happens after a CUDA OOM during environment init. "
-                            "Skipping remaining checkpoints."
-                        ),
-                    )
-                if runtime.args.fail_fast:
-                    raise
-                if unrecoverable:
-                    raise RuntimeError("Unrecoverable PhysX state; recorder must restart.")
+                logger.event(
+                    "recording_ready",
+                    message=f"Recorded video for checkpoint {checkpoint_info['iteration']}",
+                    checkpoint_path=str(checkpoint_info["checkpoint_path"]),
+                    video_path=str(final_video_path),
+                    iteration=checkpoint_info["iteration"],
+                    elapsed_s=time.perf_counter() - started_at,
+                )
+                runtime.last_processed_checkpoint = str(checkpoint_info["checkpoint_path"])
                 return
-            
-            # Use longer backoff for OOM to give the training process time
-            # to release GPU memory between iterations.
-            if is_oom:
-                backoff_time = max(30.0, runtime.args.retry_backoff * (4 ** attempt))
-            else:
-                backoff_time = runtime.args.retry_backoff * (2 ** (attempt - 1))
-            logger.event(
-                "checkpoint_retry",
-                level="INFO",
-                message=f"Retrying checkpoint {checkpoint_info['iteration']} in {backoff_time:.1f}s (attempt {attempt + 1}/{runtime.args.max_retries})",
-                checkpoint_path=str(checkpoint_info["checkpoint_path"]),
-                iteration=checkpoint_info["iteration"],
-                attempt=attempt,
-                next_attempt=attempt + 1,
-                backoff_seconds=backoff_time,
-            )
-            time.sleep(backoff_time)
+            except Exception as exc:
+                last_error_message = str(exc)
+                logger.event(
+                    "checkpoint_failed",
+                    level="ERROR",
+                    message=f"Checkpoint {checkpoint_info['iteration']} failed on attempt {attempt}: {exc}",
+                    checkpoint_path=str(checkpoint_info["checkpoint_path"]),
+                    iteration=checkpoint_info["iteration"],
+                    attempt=attempt,
+                    elapsed_s=time.perf_counter() - started_at,
+                    traceback=traceback.format_exc(),
+                )
+
+                # Detect unrecoverable errors.
+                # IsaacGym: once PhysX Foundation is created it cannot be re-created in the same process.
+                # NotImplementedError means the simulator doesn't support recording at all — never retry.
+                is_oom = "CUDA out of memory" in str(exc) or "OutOfMemoryError" in type(exc).__name__
+                is_physx_stuck = SIMULATOR == "isaacgym" and "Foundation object exists already" in str(exc)
+                is_unsupported = isinstance(exc, NotImplementedError) or "does not support" in str(exc)
+                unrecoverable = (is_physx_stuck and runtime.env is None) or is_unsupported
+
+                if is_oom:
+                    runtime.destroy_runtime()
+
+                if unrecoverable or attempt >= runtime.args.max_retries:
+                    status_store.update(
+                        key,
+                        status="failed",
+                        checkpoint_path=str(checkpoint_info["checkpoint_path"]),
+                        video_path=str(final_video_path),
+                        attempts=attempt,
+                        last_attempt_ts=time.time(),
+                        error_message=last_error_message,
+                    )
+                    if unrecoverable:
+                        logger.event(
+                            "runtime_unrecoverable",
+                            level="ERROR",
+                            message=(
+                                "PhysX Foundation cannot be re-created in this process. "
+                                "This usually happens after a CUDA OOM during environment init. "
+                                "Skipping remaining checkpoints."
+                            ),
+                        )
+                    if runtime.args.fail_fast:
+                        raise
+                    if unrecoverable:
+                        raise RuntimeError("Unrecoverable PhysX state; recorder must restart.")
+                    return
+                
+                # Use longer backoff for OOM to give the training process time
+                # to release GPU memory between iterations.
+                if is_oom:
+                    backoff_time = max(30.0, runtime.args.retry_backoff * (4 ** attempt))
+                else:
+                    backoff_time = runtime.args.retry_backoff * (2 ** (attempt - 1))
+                logger.event(
+                    "checkpoint_retry",
+                    level="INFO",
+                    message=f"Retrying checkpoint {checkpoint_info['iteration']} in {backoff_time:.1f}s (attempt {attempt + 1}/{runtime.args.max_retries})",
+                    checkpoint_path=str(checkpoint_info["checkpoint_path"]),
+                    iteration=checkpoint_info["iteration"],
+                    attempt=attempt,
+                    next_attempt=attempt + 1,
+                    backoff_seconds=backoff_time,
+                )
+                time.sleep(backoff_time)
+    finally:
+        _resume_training(train_pid, logger)
+
+
+_SIMULATORS_WITH_RECORDING_SUPPORT = {"isaacgym", "genesis", "isaaclab"}
 
 
 def main():
     args = parse_args()
-    if SIMULATOR != "isaacgym":
-        raise RuntimeError("record_checkpoints.py requires SIMULATOR=isaacgym.")
-
     logger = RecorderLogger(args.log_level)
     runtime = RecorderRuntime(args, logger)
+
+    if SIMULATOR not in _SIMULATORS_WITH_RECORDING_SUPPORT:
+        logger.event(
+            "watcher_skipped",
+            level="WARNING",
+            message=(
+                f"Video recording is not supported for SIMULATOR={SIMULATOR!r}. "
+                "Watcher will exit. Training continues unaffected."
+            ),
+            simulator=SIMULATOR,
+        )
+        return
 
     logger.event(
         "watcher_started",
@@ -816,7 +921,7 @@ def main():
                             logger.event(
                                 "recorder_fatal",
                                 level="ERROR",
-                                message="Exiting recorder due to unrecoverable PhysX state (likely CUDA OOM during init).",
+                                message="Exiting recorder due to unrecoverable simulator state (likely CUDA OOM during init).",
                             )
                             return
                         raise
@@ -833,6 +938,16 @@ def main():
                     **summary,
                 )
                 next_summary_time = time.monotonic() + args.summary_interval
+
+            if args.no_watch:
+                # One-shot mode: exit once all discovered checkpoints are in a terminal state.
+                all_done = all(
+                    (store.get(k) or {}).get("status") in {"recorded", "failed"}
+                    for store in status_stores.values()
+                    for k in store.data.get("checkpoints", {})
+                )
+                if all_done and status_stores:
+                    break
 
             time.sleep(args.poll_interval)
     except KeyboardInterrupt:
