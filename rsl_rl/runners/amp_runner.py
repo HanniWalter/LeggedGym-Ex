@@ -93,20 +93,22 @@ class AMPRunner(OnPolicyRunner):
         obs = self.env.get_observations()
         privileged_obs = self.env.get_privileged_observations()
         amp_obs = self.env.get_amp_observations()  # type: ignore[attr-defined]
-        critic_obs = privileged_obs if privileged_obs is not None else obs
-        obs, critic_obs, amp_obs = (
-            obs.to(self.device),
-            critic_obs.to(self.device),
-            amp_obs.to(self.device),
-        )
+        obs = obs.to(self.device)
+        amp_obs = amp_obs.to(self.device)
+        num_train = getattr(self.env, 'num_train_envs', self.env.num_envs)
+        val_enabled = num_train < self.env.num_envs
+        critic_obs = (
+            privileged_obs[:num_train] if privileged_obs is not None else obs[:num_train]
+        ).to(self.device)
         self.alg.actor_critic.train()
         self.alg.discriminator.train()
 
         ep_infos: List[Dict[str, Any]] = []
+        val_infos: List[Dict[str, Any]] = []
         rewbuffer: deque = deque(maxlen=100)
         lenbuffer: deque = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_reward_sum = torch.zeros(num_train, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(num_train, dtype=torch.float, device=self.device)
 
         tot_iter = self.current_learning_iteration + num_learning_iterations
         for it in range(self.current_learning_iteration, tot_iter):
@@ -114,28 +116,42 @@ class AMPRunner(OnPolicyRunner):
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    actions = self.alg.act(obs, critic_obs, amp_obs)
-                    obs, privileged_obs, rewards, dones, infos, reset_env_ids, terminal_amp_states = self.env.step(actions)  # type: ignore[misc]
+                    # Training actions (stored in PPO buffer); val actions inference only
+                    train_actions = self.alg.act(obs[:num_train], critic_obs, amp_obs[:num_train])
+                    if val_enabled:
+                        val_actions = self.alg.actor_critic.act_inference(obs[num_train:])
+                        all_actions = torch.cat([train_actions, val_actions], dim=0)
+                    else:
+                        all_actions = train_actions
+                    obs, privileged_obs, rewards, dones, infos, reset_env_ids, terminal_amp_states = self.env.step(all_actions)  # type: ignore[misc]
                     next_amp_obs = self.env.get_amp_observations()  # type: ignore[attr-defined]
 
-                    critic_obs = privileged_obs if privileged_obs is not None else obs
-                    obs, critic_obs, next_amp_obs, rewards, dones = (
-                        obs.to(self.device),
-                        critic_obs.to(self.device),
-                        next_amp_obs.to(self.device),
-                        rewards.to(self.device),
-                        dones.to(self.device),
-                    )
+                    obs = obs.to(self.device)
+                    next_amp_obs = next_amp_obs.to(self.device)
+                    rewards = rewards.to(self.device)
+                    dones = dones.to(self.device)
+                    critic_obs = (
+                        privileged_obs[:num_train] if privileged_obs is not None else obs[:num_train]
+                    ).to(self.device)
 
-                    # Account for terminal states. Use amp states before reset_idx
-                    next_amp_obs_with_term = torch.clone(next_amp_obs)
-                    next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
+                    # AMP terminal state handling: only training envs feed the discriminator
+                    train_reset_mask = reset_env_ids < num_train
+                    train_reset_ids = reset_env_ids[train_reset_mask]
+                    train_terminal_states = terminal_amp_states[train_reset_mask]
+                    next_amp_obs_with_term = torch.clone(next_amp_obs[:num_train])
+                    if len(train_reset_ids) > 0:
+                        next_amp_obs_with_term[train_reset_ids] = train_terminal_states
 
-                    rewards, amp_reward = self.alg.discriminator.predict_amp_reward(
-                        amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer
+                    rewards_train, amp_reward = self.alg.discriminator.predict_amp_reward(
+                        amp_obs[:num_train], next_amp_obs_with_term, rewards[:num_train],
+                        normalizer=self.alg.amp_normalizer
                     )
-                    amp_obs = torch.clone(next_amp_obs)
-                    self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term)
+                    amp_obs = next_amp_obs  # keep full for next step slice
+                    # Build train-only infos for PPO
+                    train_infos: Dict[str, Any] = {}
+                    if 'time_outs' in infos:
+                        train_infos['time_outs'] = infos['time_outs'][:num_train]
+                    self.alg.process_env_step(rewards_train, dones[:num_train], train_infos, next_amp_obs_with_term)
                     
                     if self.log_dir is not None:
                         # Book keeping
@@ -143,9 +159,11 @@ class AMPRunner(OnPolicyRunner):
                             # add amp reward to episode info for terminal logging
                             infos['episode']['rew_amp'] = amp_reward / self.env.dt  # type: ignore[attr-defined]
                             ep_infos.append(infos['episode'])
-                        cur_reward_sum += rewards
+                        if 'validation' in infos:
+                            val_infos.append(infos['validation'])
+                        cur_reward_sum += rewards_train
                         cur_episode_length += 1
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                        new_ids = (dones[:num_train] > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
@@ -170,6 +188,7 @@ class AMPRunner(OnPolicyRunner):
                 ckpt_dir = os.path.join(self.log_dir, 'checkpoints', f'model_{it}')
                 self.save(os.path.join(ckpt_dir, f'model_{it}.pt'))
             ep_infos.clear()
+            val_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations
         assert self.log_dir is not None
@@ -200,19 +219,45 @@ class AMPRunner(OnPolicyRunner):
         ep_string = f''
         wandb_scalars: Dict[str, Any] = {}
         if locs['ep_infos']:
-            for key in locs['ep_infos'][0]:
+            all_ep_keys: set = set()
+            for ep_info in locs['ep_infos']:
+                all_ep_keys.update(ep_info.keys())
+            for key in sorted(all_ep_keys):
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in locs['ep_infos']:
+                    if key not in ep_info:
+                        continue
                     # handle scalar and zero dimensional tensor infos
-                    if not isinstance(ep_info[key], torch.Tensor):
-                        ep_info[key] = torch.Tensor([ep_info[key]])
-                    if len(ep_info[key].shape) == 0:
-                        ep_info[key] = ep_info[key].unsqueeze(0)
-                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
-                value = torch.mean(infotensor)
-                self.writer.add_scalar('Episode/' + key, value, locs['it'])
-                wandb_scalars['Episode/' + key] = value.item()
-                ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""   
+                    v = ep_info[key]
+                    if not isinstance(v, torch.Tensor):
+                        v = torch.Tensor([v])
+                    if len(v.shape) == 0:
+                        v = v.unsqueeze(0)
+                    infotensor = torch.cat((infotensor, v.to(self.device)))
+                if len(infotensor) > 0:
+                    value = torch.mean(infotensor)
+                    self.writer.add_scalar('Episode/' + key, value, locs['it'])
+                    wandb_scalars['Episode/' + key] = value.item()
+                    ep_string += f"""{ f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
+        if locs.get('val_infos'):
+            all_keys: set = set()
+            for vi in locs['val_infos']:
+                all_keys.update(vi.keys())
+            for key in sorted(all_keys):
+                infotensor = torch.tensor([], device=self.device)
+                for val_info in locs['val_infos']:
+                    if key not in val_info:
+                        continue
+                    v = val_info[key]
+                    if not isinstance(v, torch.Tensor):
+                        v = torch.Tensor([v])
+                    if len(v.shape) == 0:
+                        v = v.unsqueeze(0)
+                    infotensor = torch.cat((infotensor, v.to(self.device)))
+                if len(infotensor) > 0:
+                    value = torch.mean(infotensor)
+                    self.writer.add_scalar('Validation/' + key, value, locs['it'])
+                    wandb_scalars['Validation/' + key] = value.item()
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
 

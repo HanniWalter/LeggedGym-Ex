@@ -103,8 +103,17 @@ class GenesisSimulator(Simulator):
         if self._cfg.domain_rand.randomize_ctrl_delay:
             self._action_queue[env_ids] *= 0.
             self._action_queue[env_ids] = 0.
-            self._action_delay[env_ids] = torch.randint(self._cfg.domain_rand.ctrl_delay_step_range[0],
-                                                       self._cfg.domain_rand.ctrl_delay_step_range[1]+1, (len(env_ids),), device=self._device, requires_grad=False)
+            domain_rand_env_ids = self._domain_rand_env_ids(env_ids)
+            if len(domain_rand_env_ids) > 0:
+                self._action_delay[domain_rand_env_ids] = torch.randint(
+                    self._cfg.domain_rand.ctrl_delay_step_range[0],
+                    self._cfg.domain_rand.ctrl_delay_step_range[1] + 1,
+                    (len(domain_rand_env_ids),),
+                    device=self._device,
+                    requires_grad=False,
+                )
+            if self._clean_validation_domain_rand_enabled():
+                self._action_delay[env_ids[env_ids >= self._cfg.validation.start_idx]] = 0
 
     def reset_dofs(self, env_ids, dof_pos, dof_vel):
         """ Resets DOF position and velocities of selected environmments
@@ -171,24 +180,31 @@ class GenesisSimulator(Simulator):
         self._env_origins[env_ids] = self._terrain_origins[self._terrain_levels[env_ids],
             self._terrain_types[env_ids]]
 
-    def push_robots(self):
+    def push_robots(self, env_ids=None):
+        env_ids = torch.arange(self._num_envs, device=self._device) if env_ids is None else env_ids
+        if len(env_ids) == 0:
+            return
         max_push_vel_xy = self._cfg.domain_rand.max_push_vel_xy
         # in Genesis, base link also has DOF, it's 6DOF if not fixed.
         dofs_vel = self._robot.get_dofs_velocity()  # (num_envs, num_dof) [0:3] ~ base_link_vel
         push_vel = torch_rand_float(-max_push_vel_xy,
-                                     max_push_vel_xy, (self._num_envs, 2), self._device)
-        self._rand_push_vels[:, :2] = push_vel.detach().clone()
-        dofs_vel[:, :2] += push_vel
-        self._robot.set_dofs_velocity(dofs_vel)
-        self._last_base_lin_vel[:] = self._base_lin_vel[:]
-        self._base_lin_vel[:] = quat_rotate_inverse(
-            self._base_quat, self._robot.get_vel())
+                                     max_push_vel_xy, (len(env_ids), 2), self._device)
+        self._rand_push_vels[env_ids, :2] = push_vel.detach().clone()
+        dofs_vel[env_ids, :2] += push_vel
+        self._robot.set_dofs_velocity(velocity=dofs_vel[env_ids], envs_idx=env_ids)
+        self._last_base_lin_vel[env_ids] = self._base_lin_vel[env_ids]
+        self._base_lin_vel[env_ids] = quat_rotate_inverse(
+            self._base_quat[env_ids], self._robot.get_vel()[env_ids])
     
-    def push_links(self):
+    def push_links(self, env_ids=None):
+        env_ids = torch.arange(self._num_envs, device=self._device) if env_ids is None else env_ids
+        if len(env_ids) == 0:
+            return
         max_force = self._cfg.domain_rand.max_push_force
         # apply random forces to the links of the robot
-        push_force = torch.rand((self._num_envs, self._robot.n_links, 3), 
-                                device=self._device) * 2 * max_force - max_force
+        push_force = torch.zeros((self._num_envs, self._robot.n_links, 3), device=self._device)
+        push_force[env_ids] = torch.rand((len(env_ids), self._robot.n_links, 3), 
+                                         device=self._device) * 2 * max_force - max_force
         # Cache the link index list — it is invariant after build.
         if not hasattr(self, "_all_link_idx"):
             self._all_link_idx = [link.idx - self._robot.link_start for link in self._robot.links]
@@ -916,6 +932,9 @@ class GenesisSimulator(Simulator):
 
     def _randomize_friction(self, env_ids=None):
         ''' Randomize friction of all links'''
+        env_ids = self._domain_rand_env_ids(env_ids)
+        if len(env_ids) == 0:
+            return
         min_friction, max_friction = self._cfg.domain_rand.friction_range
 
         ratios = gs.rand((len(env_ids), 1), dtype=float).repeat(1, self._robot.n_links) \
@@ -931,6 +950,9 @@ class GenesisSimulator(Simulator):
 
     def _randomize_base_mass(self, env_ids=None):
         ''' Randomize base mass'''
+        env_ids = self._domain_rand_env_ids(env_ids)
+        if len(env_ids) == 0:
+            return
         min_mass, max_mass = self._cfg.domain_rand.added_mass_range
         added_mass = gs.rand((len(env_ids), 1), dtype=float) * \
             (max_mass - min_mass) + min_mass
@@ -939,6 +961,9 @@ class GenesisSimulator(Simulator):
 
     def _randomize_com_displacement(self, env_ids):
         ''' Randomize center of mass displacement of the robot'''
+        env_ids = self._domain_rand_env_ids(env_ids)
+        if len(env_ids) == 0:
+            return
         min_displacement_x, max_displacement_x = self._cfg.domain_rand.com_pos_x_range
         min_displacement_y, max_displacement_y = self._cfg.domain_rand.com_pos_y_range
         min_displacement_z, max_displacement_z = self._cfg.domain_rand.com_pos_z_range
@@ -957,6 +982,9 @@ class GenesisSimulator(Simulator):
             com_displacement, self._base_link_index, env_ids)
 
     def _randomize_joint_armature(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
+        if len(env_ids) == 0:
+            return
         min_armature, max_armature = self._cfg.domain_rand.joint_armature_range
         armature = torch.rand((len(env_ids),), dtype=torch.float, device=self._device) \
             * (max_armature - min_armature) + min_armature
@@ -968,6 +996,9 @@ class GenesisSimulator(Simulator):
         # This armature will be Refreshed when envs are reset
 
     def _randomize_joint_friction(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
+        if len(env_ids) == 0:
+            return
         min_friction, max_friction = self._cfg.domain_rand.joint_friction_range
         friction = torch.rand((len(env_ids),), dtype=torch.float, device=self._device) \
             * (max_friction - min_friction) + min_friction
@@ -979,6 +1010,9 @@ class GenesisSimulator(Simulator):
     def _randomize_joint_damping(self, env_ids):
         """ Randomize joint damping of the robot
         """
+        env_ids = self._domain_rand_env_ids(env_ids)
+        if len(env_ids) == 0:
+            return
         min_damping, max_damping = self._cfg.domain_rand.joint_damping_range
         damping = torch.rand((len(env_ids),), dtype=torch.float, device=self._device) \
             * (max_damping - min_damping) + min_damping
@@ -988,6 +1022,9 @@ class GenesisSimulator(Simulator):
             damping, self._dof_indices, envs_idx=env_ids)
 
     def _randomize_pd_gain(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
+        if len(env_ids) == 0:
+            return
         self._kp_scale[env_ids] = torch_rand_float(
                 self._cfg.domain_rand.kp_range[0], self._cfg.domain_rand.kp_range[1], (len(env_ids), self._num_actions), device=self._device)
         self._kd_scale[env_ids] = torch_rand_float(

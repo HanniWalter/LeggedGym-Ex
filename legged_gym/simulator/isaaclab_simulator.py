@@ -113,8 +113,17 @@ class IsaacLabSimulator(Simulator):
         if self._cfg.domain_rand.randomize_ctrl_delay:
             self._action_queue[env_ids] *= 0.
             self._action_queue[env_ids] = 0.
-            self._action_delay[env_ids] = torch.randint(self._cfg.domain_rand.ctrl_delay_step_range[0],
-                                                       self._cfg.domain_rand.ctrl_delay_step_range[1]+1, (len(env_ids),), device=self._device, requires_grad=False)
+            domain_rand_env_ids = self._domain_rand_env_ids(env_ids)
+            if len(domain_rand_env_ids) > 0:
+                self._action_delay[domain_rand_env_ids] = torch.randint(
+                    self._cfg.domain_rand.ctrl_delay_step_range[0],
+                    self._cfg.domain_rand.ctrl_delay_step_range[1] + 1,
+                    (len(domain_rand_env_ids),),
+                    device=self._device,
+                    requires_grad=False,
+                )
+            if self._clean_validation_domain_rand_enabled():
+                self._action_delay[env_ids[env_ids >= self._cfg.validation.start_idx]] = 0
     
     def reset_dofs(self, env_ids, dof_pos, dof_vel):
         self._robot.write_joint_state_to_sim(dof_pos, dof_vel, self._dof_indices, env_ids)
@@ -150,23 +159,30 @@ class IsaacLabSimulator(Simulator):
         self._env_origins[env_ids] = self._terrain_origins[self._terrain_levels[env_ids],
             self._terrain_types[env_ids]]
         
-    def push_robots(self):
+    def push_robots(self, env_ids=None):
+        env_ids = torch.arange(self._num_envs, device=self._device) if env_ids is None else env_ids
+        if len(env_ids) == 0:
+            return
         max_push_vel_xy = self._cfg.domain_rand.max_push_vel_xy
         cur_root_vel = self._robot.data.root_link_vel_w[:, :3]
         push_vel = torch_rand_float(-max_push_vel_xy,
-                                    max_push_vel_xy, (self._num_envs, 2), device=self._device)
-        self._rand_push_vels[:, :2] = push_vel.detach().clone()
-        cur_root_vel[:, :2] += push_vel
+                                    max_push_vel_xy, (len(env_ids), 2), device=self._device)
+        self._rand_push_vels[env_ids, :2] = push_vel.detach().clone()
+        cur_root_vel[env_ids, :2] += push_vel
         root_vel = torch.cat([cur_root_vel, self._robot.data.root_link_vel_w[:, 3:6]], dim=-1)
-        self._robot.write_root_link_velocity_to_sim(root_vel)
-        self._last_base_lin_vel[:] = self._base_lin_vel[:]
-        self._base_lin_vel[:] = quat_rotate_inverse(self._base_quat, self._robot.data.root_link_lin_vel_w)[:]
+        self._robot.write_root_link_velocity_to_sim(root_vel[env_ids], env_ids=env_ids)
+        self._last_base_lin_vel[env_ids] = self._base_lin_vel[env_ids]
+        self._base_lin_vel[env_ids] = quat_rotate_inverse(self._base_quat[env_ids], self._robot.data.root_link_lin_vel_w[env_ids])[:]
     
-    def push_links(self):
+    def push_links(self, env_ids=None):
+        env_ids = torch.arange(self._num_envs, device=self._device) if env_ids is None else env_ids
+        if len(env_ids) == 0:
+            return
         max_force = self._cfg.domain_rand.max_push_force
         # apply random forces to the links of the robot
-        push_force = torch.rand((self._num_envs, self._num_bodies, 3), 
-                                device=self._device) * 2 * max_force - max_force
+        push_force = torch.zeros((self._num_envs, self._num_bodies, 3), device=self._device)
+        push_force[env_ids] = torch.rand((len(env_ids), self._num_bodies, 3), 
+                                         device=self._device) * 2 * max_force - max_force
         self._robot.instantaneous_wrench_composer.set_forces_and_torques(
             push_force, 
             torch.zeros_like(push_force), # zero torque
@@ -809,6 +825,7 @@ class IsaacLabSimulator(Simulator):
             self._num_envs, self._num_dof, dtype=torch.float, device=self._device, requires_grad=False)
     
     def _randomize_friction(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
         if len(env_ids) == 0:
             return
         min_friction, max_friction = self._cfg.domain_rand.friction_range
@@ -832,6 +849,7 @@ class IsaacLabSimulator(Simulator):
         )
 
     def _randomize_restitution(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
         if len(env_ids) == 0:
             return
         min_restitution, max_restitution = self._cfg.domain_rand.restitution_range
@@ -851,6 +869,7 @@ class IsaacLabSimulator(Simulator):
         )
 
     def _randomize_base_mass(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
         if len(env_ids) == 0:
             return
         min_mass, max_mass = self._cfg.domain_rand.added_mass_range
@@ -869,6 +888,7 @@ class IsaacLabSimulator(Simulator):
         self._robot.root_physx_view.set_masses(mass_after_dr.to("cpu"), all_indices)
         
     def _randomize_com_displacement(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
         if len(env_ids) == 0:
             return
         min_displacement_x, max_displacement_x = self._cfg.domain_rand.com_pos_x_range
@@ -894,6 +914,7 @@ class IsaacLabSimulator(Simulator):
         self._robot.root_physx_view.set_coms(com_after_dr.to("cpu"), all_indices)
     
     def _randomize_joint_armature(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
         if len(env_ids) == 0:
             return
         
@@ -908,6 +929,7 @@ class IsaacLabSimulator(Simulator):
         self._robot.write_joint_armature_to_sim(armature, self._dof_indices, env_ids)
     
     def _randomize_joint_friction(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
         if len(env_ids) == 0:
             return
         
@@ -922,6 +944,7 @@ class IsaacLabSimulator(Simulator):
             friction, None, None, self._dof_indices, env_ids) # currently, only static friction coefficients are considered
         
     def _randomize_joint_damping(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
         if len(env_ids) == 0:
             return
         
@@ -934,6 +957,9 @@ class IsaacLabSimulator(Simulator):
         self._robot.write_joint_damping_to_sim(damping, self._dof_indices, env_ids)
         
     def _randomize_pd_gain(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
+        if len(env_ids) == 0:
+            return
         self._kp_scale[env_ids] = torch_rand_float(
                 self._cfg.domain_rand.kp_range[0], self._cfg.domain_rand.kp_range[1], (len(env_ids), self._num_actions), device=self._device)
         self._kd_scale[env_ids] = torch_rand_float(

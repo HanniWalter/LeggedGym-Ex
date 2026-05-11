@@ -241,6 +241,21 @@ class LeggedRobotCfg(BaseConfig):
             gravity: float = 0.05
             height_measurements: float = 0.1
     
+    # Validation environments run fixed-command scenarios in parallel with training.
+    # They are appended after the training envs and never contribute to PPO gradients.
+    class validation:
+        enabled: bool = False
+        clean_domain_rand: bool = True
+        num_envs_per_scenario: int = 32
+        # Each scenario: (lin_vel_x, lin_vel_y, ang_vel_yaw) in [m/s, m/s, rad/s].
+        # Note: the 1.0 m/s scenario only yields data once the command curriculum
+        # has expanded lin_vel_x to ±1.0.
+        scenarios: List[Tuple[float, float, float]] = [
+            (0.0, 0.0, 0.0),   # stand still
+            (0.5, 0.0, 0.0),   # walk forward at 0.5 m/s
+            (1.0, 0.0, 0.0),   # walk forward at 1.0 m/s
+        ]
+
     # constraints config for CaT (Constraints as Termination)
     class constraints:
         class limits:

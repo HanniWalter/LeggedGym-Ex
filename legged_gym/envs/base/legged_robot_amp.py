@@ -43,14 +43,35 @@ class LeggedRobotAMP(LeggedRobot):
         self.terminal_amp_states = self.get_amp_observations()[env_ids]
         if len(env_ids) == 0:
             return
-        # update curriculum
+
+        # Split into training and validation env ids
+        if self._val_enabled:
+            train_env_ids = env_ids[env_ids < self.num_train_envs]
+            val_reset_ids = env_ids[env_ids >= self.val_start_idx]
+        else:
+            train_env_ids = env_ids
+            val_reset_ids = torch.zeros(0, dtype=env_ids.dtype, device=self.device)
+
+        # Compute validation metrics BEFORE reset (time_out_buf still valid)
+        if len(val_reset_ids) > 0:
+            self._compute_validation_metrics(val_reset_ids)
+
+        # update curriculum (training envs only)
         if self.cfg.terrain.curriculum:
-            self._update_terrain_curriculum(env_ids)
+            if len(train_env_ids) > 0:
+                self._update_terrain_curriculum(train_env_ids)
         # avoid updating command curriculum at each step since the maximum command is common to all envs
         if self.cfg.commands.curriculum and (self.common_step_counter % self.max_episode_length ==0):
-            self._update_command_curriculum(env_ids)
+            if len(train_env_ids) > 0:
+                self._update_command_curriculum(train_env_ids)
 
-        self._resample_commands(env_ids)
+        # Resample commands for training envs only; restore fixed commands for val envs
+        if len(train_env_ids) > 0:
+            self._resample_commands(train_env_ids)
+        if len(val_reset_ids) > 0:
+            local_ids = val_reset_ids - self.val_start_idx
+            self.commands[val_reset_ids, :3] = self.val_env_cmd[local_ids]
+
         _ = np.random.random()
         if self.cfg.init_state.reference_state_initialization \
             and _ < self.cfg.init_state.reference_state_initialization_prob:
@@ -71,11 +92,13 @@ class LeggedRobotAMP(LeggedRobot):
         self.reset_buf[env_ids] = 1
         self.fail_buf[env_ids] = 0
 
-        # fill extras
+        # fill extras: episode metrics from training envs only
         self.extras["episode"] = {}
+        if len(train_env_ids) > 0:
+            for key in self.episode_sums.keys():
+                self.extras["episode"]['rew_' + key] = torch.mean(
+                    self.episode_sums[key][train_env_ids]) / self.max_episode_length_s
         for key in self.episode_sums.keys():
-            self.extras["episode"]['rew_' + key] = torch.mean(
-                self.episode_sums[key][env_ids]) / self.max_episode_length_s
             self.episode_sums[key][env_ids] = 0.
         # log additional curriculum info
         if self.cfg.terrain.curriculum:

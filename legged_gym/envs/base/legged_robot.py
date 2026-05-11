@@ -91,6 +91,22 @@ class LeggedRobot(BaseTask):
         
         self.cfg: LeggedRobotCfg = cfg
         self.init_done: bool = False
+
+        # Validation env setup: expand num_envs BEFORE simulator init so the
+        # simulator creates training + validation environments in one scene.
+        self.num_train_envs: int = cfg.env.num_envs
+        self._val_enabled: bool = (
+            hasattr(cfg, 'validation') and getattr(cfg.validation, 'enabled', False)
+        )
+        if self._val_enabled:
+            _n_per = cfg.validation.num_envs_per_scenario
+            _n_scen = len(cfg.validation.scenarios)
+            self._num_val_envs: int = _n_per * _n_scen
+            cfg.validation.start_idx = self.num_train_envs
+            cfg.env.num_envs += self._num_val_envs
+        else:
+            self._num_val_envs = 0
+
         self._parse_cfg(self.cfg)
         super().__init__(self.cfg, sim_params, sim_device, headless)
         
@@ -194,6 +210,10 @@ class LeggedRobot(BaseTask):
         # compute observations, rewards, resets, ...
         self.check_termination()
         self.compute_reward()
+        # Accumulate forward velocity for validation environments
+        if self._val_enabled:
+            self.val_vel_sum[self.val_start_idx:] += self.simulator.base_lin_vel[self.val_start_idx:, 0]
+            self.val_step_count[self.val_start_idx:] += 1
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
         self.simulator.update_sensors()
@@ -250,14 +270,35 @@ class LeggedRobot(BaseTask):
         """
         if len(env_ids) == 0:
             return
-        # update curriculum
+
+        # Split into training and validation env ids
+        if self._val_enabled:
+            train_env_ids = env_ids[env_ids < self.num_train_envs]
+            val_reset_ids = env_ids[env_ids >= self.val_start_idx]
+        else:
+            train_env_ids = env_ids
+            val_reset_ids = torch.zeros(0, dtype=env_ids.dtype, device=self.device)
+
+        # Compute validation metrics BEFORE reset (time_out_buf still valid)
+        if len(val_reset_ids) > 0:
+            self._compute_validation_metrics(val_reset_ids)
+
+        # update curriculum (training envs only)
         if self.cfg.terrain.curriculum:
-            self._update_terrain_curriculum(env_ids)
+            if len(train_env_ids) > 0:
+                self._update_terrain_curriculum(train_env_ids)
         # avoid updating command curriculum at each step since the maximum command is common to all envs
         if self.cfg.commands.curriculum and (self.common_step_counter % self.max_episode_length ==0):
-            self._update_command_curriculum(env_ids)
+            if len(train_env_ids) > 0:
+                self._update_command_curriculum(train_env_ids)
 
-        self._resample_commands(env_ids)
+        # Resample commands for training envs only; restore fixed commands for val envs
+        if len(train_env_ids) > 0:
+            self._resample_commands(train_env_ids)
+        if len(val_reset_ids) > 0:
+            local_ids = val_reset_ids - self.val_start_idx
+            self.commands[val_reset_ids, :3] = self.val_env_cmd[local_ids]
+
         self._reset_dofs(env_ids)
         self._reset_root_states(env_ids)
         self.simulator.reset_idx(env_ids)
@@ -271,11 +312,13 @@ class LeggedRobot(BaseTask):
         self.reset_buf[env_ids] = 1
         self.fail_buf[env_ids] = 0
 
-        # fill extras
+        # fill extras: episode metrics from training envs only
         self.extras["episode"] = {}
+        if len(train_env_ids) > 0:
+            for key in self.episode_sums.keys():
+                self.extras["episode"]['rew_' + key] = torch.mean(
+                    self.episode_sums[key][train_env_ids]) / self.max_episode_length_s
         for key in self.episode_sums.keys():
-            self.extras["episode"]['rew_' + key] = torch.mean(
-                self.episode_sums[key][env_ids]) / self.max_episode_length_s
             self.episode_sums[key][env_ids] = 0.
         # log additional curriculum info
         if self.cfg.terrain.curriculum:
@@ -491,12 +534,19 @@ class LeggedRobot(BaseTask):
                                                                  self.cfg.commands.ranges.ang_vel_yaw[1])
 
         if self.cfg.domain_rand.push_robots and (self.common_step_counter % self.cfg.domain_rand.push_interval == 0):
-            self.simulator.push_robots()
+            self.simulator.push_robots(self._domain_rand_env_ids())
             # print(f"pushing robots")
         if self.cfg.domain_rand.push_links and (self.common_step_counter % self.cfg.domain_rand.push_links_interval == 0):
-            self.simulator.push_links()
+            self.simulator.push_links(self._domain_rand_env_ids())
             # print(f"pushing links")
-        
+        # Restore fixed commands for val envs after periodic resampling / heading update
+        self._restore_val_commands()
+
+    def _domain_rand_env_ids(self) -> EnvIds:
+        if self._val_enabled and getattr(self.cfg.validation, 'clean_domain_rand', True):
+            return torch.arange(self.num_train_envs, device=self.device)
+        return torch.arange(self.num_envs, device=self.device)
+
     def _resample_commands(self, env_ids: EnvIds) -> None:
         """ Randommly select commands of some environments
 
@@ -604,6 +654,71 @@ class LeggedRobot(BaseTask):
         self.feet_air_time = torch.zeros(
             (self.num_envs, len(self.simulator.feet_indices)), device=self.device, dtype=torch.float)
         self.last_contacts = torch.zeros((self.num_envs, len(self.simulator.feet_indices)), device=self.device, dtype=torch.int)
+
+        # Validation environment buffers
+        if self._val_enabled:
+            n_per = self.cfg.validation.num_envs_per_scenario
+            scenarios = self.cfg.validation.scenarios
+            self.val_start_idx: int = self.num_train_envs
+            # Fixed commands for each val env: (num_val_envs, 3) = [lin_vel_x, lin_vel_y, ang_vel_yaw]
+            val_cmd_list = [
+                torch.tensor(list(cmd[:3]), device=self.device, dtype=torch.float)
+                      .unsqueeze(0).expand(n_per, -1)
+                for cmd in scenarios
+            ]
+            self.val_env_cmd = torch.cat(val_cmd_list, dim=0)  # (num_val_envs, 3)
+            # Scenario index for each val env (0, 1, 2, ...)
+            self.val_env_scenario = torch.repeat_interleave(
+                torch.arange(len(scenarios), device=self.device), n_per
+            )  # (num_val_envs,)
+            # Per-episode velocity accumulation (for mean forward vel metric)
+            self.val_vel_sum = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+            self.val_step_count = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+            # Set initial fixed commands for val envs
+            self.commands[self.val_start_idx:, :3] = self.val_env_cmd
+
+    def _restore_val_commands(self) -> None:
+        """Restore fixed commands for validation environments after any resampling."""
+        if not self._val_enabled:
+            return
+        self.commands[self.val_start_idx:, :3] = self.val_env_cmd
+
+    def _compute_validation_metrics(self, val_reset_ids: EnvIds) -> None:
+        """Compute per-scenario validation metrics for resetting val envs.
+
+        vel_*: distance walked until first fall / episode_length_s  [m/s]
+            = val_vel_sum * dt / episode_length_s
+            = val_vel_sum / max_episode_length
+          A robot hitting 1.0 m/s for the full episode scores 1.0; if it falls
+          at half-time the score is halved, regardless of speed.
+
+        survival_time_*: fraction of episode survived [0, 1]
+          1.0 = full episode, <1.0 = fell early.
+        """
+        local_ids = val_reset_ids - self.val_start_idx
+        # Effective velocity: distance walked / episode_length_s
+        # val_vel_sum accumulates raw base_lin_vel[x] per step, so:
+        #   distance = val_vel_sum * dt  →  dist / episode_length_s = val_vel_sum / max_episode_length
+        eff_vel = self.val_vel_sum[val_reset_ids] / self.max_episode_length
+        # Survival time: 1.0 = survived full episode, <1.0 = fell early.
+        survival_ratio = torch.where(
+            self.time_out_buf[val_reset_ids].bool(),
+            torch.ones(len(val_reset_ids), device=self.device, dtype=torch.float),
+            self.episode_length_buf[val_reset_ids].float() / self.max_episode_length,
+        )
+        scenarios = self.cfg.validation.scenarios
+        val_metrics: Dict[str, Tensor] = {}
+        for s_idx, scenario in enumerate(scenarios):
+            mask = self.val_env_scenario[local_ids] == s_idx
+            if mask.any():
+                label = f"{scenario[0]:.1f}"
+                val_metrics[f"vel_{label}"] = eff_vel[mask].mean().unsqueeze(0)
+                val_metrics[f"survival_time_{label}"] = survival_ratio[mask].mean().unsqueeze(0)
+        if val_metrics:
+            self.extras["validation"] = val_metrics
+        # Reset accumulators for these val envs
+        self.val_vel_sum[val_reset_ids] = 0.0
+        self.val_step_count[val_reset_ids] = 0
 
     def _prepare_reward_function(self) -> None:
         """ Prepares a list of reward functions, whcih will be called to compute the total reward.

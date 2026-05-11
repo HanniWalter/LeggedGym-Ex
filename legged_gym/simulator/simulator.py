@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 import torch
 from torch import Tensor
 import numpy as np
+from typing import Optional
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
 from legged_gym.utils.math_utils import dr_normalize
 
@@ -19,6 +20,7 @@ class Simulator(ABC):
         self._create_sim()
         self._create_envs()
         self._init_buffers()
+        self._reset_clean_validation_domain_params()
 
     #----- Public methods -----#
     @abstractmethod
@@ -89,13 +91,13 @@ class Simulator(ABC):
         return
     
     @abstractmethod
-    def push_robots(self):
+    def push_robots(self, env_ids: Optional[Tensor] = None):
         """Apply perturbation velocity to the base of the robot as domain randomization.
         """
         return
     
     @abstractmethod
-    def push_links(self):
+    def push_links(self, env_ids: Optional[Tensor] = None):
         """Apply perturbation forces to the links of the robot as domain randomization.
         """
         return
@@ -217,6 +219,43 @@ class Simulator(ABC):
         """Initializes domain randomization parameters, which are used as privilege information.
         """
         return
+
+    def _clean_validation_domain_rand_enabled(self) -> bool:
+        return (
+            hasattr(self._cfg, 'validation')
+            and getattr(self._cfg.validation, 'enabled', False)
+            and getattr(self._cfg.validation, 'clean_domain_rand', True)
+            and hasattr(self._cfg.validation, 'start_idx')
+        )
+
+    def _is_clean_validation_env(self, env_id: int) -> bool:
+        return self._clean_validation_domain_rand_enabled() and env_id >= self._cfg.validation.start_idx
+
+    def _domain_rand_env_ids(self, env_ids):
+        if not self._clean_validation_domain_rand_enabled():
+            return env_ids
+        start_idx = self._cfg.validation.start_idx
+        if isinstance(env_ids, torch.Tensor):
+            return env_ids[env_ids < start_idx]
+        env_ids_array = np.asarray(env_ids)
+        return env_ids_array[env_ids_array < start_idx]
+
+    def _reset_clean_validation_domain_params(self) -> None:
+        if not self._clean_validation_domain_rand_enabled():
+            return
+        val_ids = slice(self._cfg.validation.start_idx, self._num_envs)
+        if hasattr(self, '_action_delay'):
+            self._action_delay[val_ids] = 0
+        if hasattr(self, '_rand_push_vels'):
+            self._rand_push_vels[val_ids] = 0.0
+        if hasattr(self, '_kp_scale'):
+            self._kp_scale[val_ids] = 1.0
+        if hasattr(self, '_kd_scale'):
+            self._kd_scale[val_ids] = 1.0
+        if hasattr(self, '_added_base_mass'):
+            self._added_base_mass[val_ids] = 0.0
+        if hasattr(self, '_base_com_bias'):
+            self._base_com_bias[val_ids] = 0.0
     
     @abstractmethod
     def _randomize_friction(self, env_ids: Tensor):

@@ -105,6 +105,12 @@ class K1AMPCfg(K1FlatCommonCfg):
     class viewer(K1FlatCommonCfg.viewer):
         pos = [1.0, 1.0, 0.5]
 
+    class validation(K1FlatCommonCfg.validation):
+        enabled = True
+        num_envs_per_scenario = 32  # 3 scenarios × 32 = 96 additional envs
+        # (0.0: stand still, 0.5: walk forward, 1.0: fast forward)
+        # The 1.0 m/s scenario only yields data once the command curriculum expands to ±1.0.
+
     class asset(K1FlatCommonCfg.asset):
         # K1-AMP trains on flat terrain → self-collision between arms/torso is not
         # physically relevant and disabling it saves significant GPU time in Genesis.

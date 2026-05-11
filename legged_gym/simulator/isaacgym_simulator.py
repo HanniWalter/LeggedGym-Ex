@@ -67,7 +67,6 @@ class IsaacGymSimulator(Simulator):
     def post_physics_step(self):
         self._gym.refresh_actor_root_state_tensor(self._sim)
         self._check_base_pos_out_of_bound()
-        self._gym.refresh_actor_root_state_tensor(self._sim)
         self._gym.refresh_net_contact_force_tensor(self._sim)
         self._gym.refresh_rigid_body_state_tensor(self._sim)
         # the wrapped tensor will be updated automatically once you call refresh_xxx_tensor
@@ -107,18 +106,22 @@ class IsaacGymSimulator(Simulator):
         
         # reset action queue and delay
         if self._cfg.domain_rand.randomize_ctrl_delay:
-            self._action_queue[env_ids] *= 0.
             self._action_queue[env_ids] = 0.
-            self._action_delay[env_ids] = torch.randint(self._cfg.domain_rand.ctrl_delay_step_range[0],
-                                                       self._cfg.domain_rand.ctrl_delay_step_range[1]+1, (len(env_ids),), device=self._device, requires_grad=False)
+            domain_rand_env_ids = self._domain_rand_env_ids(env_ids)
+            if len(domain_rand_env_ids) > 0:
+                self._action_delay[domain_rand_env_ids] = torch.randint(
+                    self._cfg.domain_rand.ctrl_delay_step_range[0],
+                    self._cfg.domain_rand.ctrl_delay_step_range[1] + 1,
+                    (len(domain_rand_env_ids),),
+                    device=self._device,
+                    requires_grad=False,
+                )
+            if self._clean_validation_domain_rand_enabled():
+                self._action_delay[env_ids[env_ids >= self._cfg.validation.start_idx]] = 0
         
-        # reset depth image tensors
-        # find common ids between env_ids and camera env ids
+        # reset depth image tensors for camera envs only
         if self._cfg.sensor.add_depth:
-            camera_env_ids = torch.arange(self._num_camera_envs, device=self._device)
-            common_env_ids = torch.tensor(
-                [env_id for env_id in env_ids.tolist() if env_id in camera_env_ids.tolist()],
-                device=self._device, dtype=torch.long)
+            common_env_ids = env_ids[env_ids < self._num_camera_envs]
             self._depth_images[common_env_ids, :] = 0.
             
     def reset_dofs(self, env_ids, dof_pos, dof_vel):
@@ -169,19 +172,32 @@ class IsaacGymSimulator(Simulator):
         self._env_origins[env_ids] = self._terrain_origins[self._terrain_levels[env_ids],
             self._terrain_types[env_ids]]
     
-    def push_robots(self):
+    def push_robots(self, env_ids=None):
+        env_ids = torch.arange(self._num_envs, device=self._device) if env_ids is None else env_ids
+        if len(env_ids) == 0:
+            return
         max_vel = self._cfg.domain_rand.max_push_vel_xy
-        self._rand_push_vels[:, :2] = torch_rand_float(-max_vel, max_vel, (self._num_envs, 2), device=self._device)
-        self._root_states[:, 7:9] += self._rand_push_vels[:, :2] # set random base velocity in xy plane
-        self._gym.set_actor_root_state_tensor(self._sim, gymtorch.unwrap_tensor(self._root_states))
-        self._last_base_lin_vel[:] = self._base_lin_vel[:]
-        self._base_lin_vel[:] = quat_rotate_inverse(
-            self._base_quat, self._root_states[:, 7:10])
+        self._rand_push_vels[env_ids, :2] = torch_rand_float(-max_vel, max_vel, (len(env_ids), 2), device=self._device)
+        self._root_states[env_ids, 7:9] += self._rand_push_vels[env_ids, :2] # set random base velocity in xy plane
+        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        self._gym.set_actor_root_state_tensor_indexed(
+            self._sim,
+            gymtorch.unwrap_tensor(self._root_states),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32),
+        )
+        self._last_base_lin_vel[env_ids] = self._base_lin_vel[env_ids]
+        self._base_lin_vel[env_ids] = quat_rotate_inverse(
+            self._base_quat[env_ids], self._root_states[env_ids, 7:10])
     
-    def push_links(self):
+    def push_links(self, env_ids=None):
+        env_ids = torch.arange(self._num_envs, device=self._device) if env_ids is None else env_ids
+        if len(env_ids) == 0:
+            return
         max_force = self._cfg.domain_rand.max_push_force
-        push_force = torch.rand((self._num_envs, self._num_bodies, 3), 
-                                device=self._device) * 2 * max_force - max_force
+        push_force = torch.zeros((self._num_envs, self._num_bodies, 3), device=self._device)
+        push_force[env_ids] = torch.rand((len(env_ids), self._num_bodies, 3), 
+                                         device=self._device) * 2 * max_force - max_force
         self._gym.apply_rigid_body_force_tensors(
             self._sim,
             gymtorch.unwrap_tensor(push_force),
@@ -761,8 +777,9 @@ class IsaacGymSimulator(Simulator):
             normal_vector /= torch.norm(normal_vector, dim=-1, keepdim=True)
             self._normal_vector_around_feet[:, i*3:i*3+3] = normal_vector[:]
         # Calculate height around feet
-        for i in range(9):
-            self._height_around_feet[:, :, i] = eval(f'heights{i+1}').view(self._num_envs, -1)[:] * self._cfg.terrain.vertical_scale
+        heights_list = [heights1, heights2, heights3, heights4, heights5, heights6, heights7, heights8, heights9]
+        for i, h in enumerate(heights_list):
+            self._height_around_feet[:, :, i] = h.view(self._num_envs, -1) * self._cfg.terrain.vertical_scale
     
     def _check_base_pos_out_of_bound(self):
         """ Check if the base position is out of the terrain bounds
@@ -865,6 +882,9 @@ class IsaacGymSimulator(Simulator):
         return super()._randomize_joint_damping(env_ids)
     
     def _randomize_pd_gain(self, env_ids):
+        env_ids = self._domain_rand_env_ids(env_ids)
+        if len(env_ids) == 0:
+            return
         self._kp_scale[env_ids] = torch_rand_float(
                 self._cfg.domain_rand.kp_range[0], self._cfg.domain_rand.kp_range[1], (len(env_ids), self._num_actions), device=self._device)
         self._kd_scale[env_ids] = torch_rand_float(
@@ -1175,7 +1195,15 @@ class IsaacGymSimulator(Simulator):
         Returns:
             [List[gymapi.RigidShapeProperties]]: Modified rigid shape properties
         """
-        if self._cfg.domain_rand.randomize_friction:
+        if self._is_clean_validation_env(env_id):
+            for s in range(len(props)):
+                props[s].friction = self._cfg.terrain.static_friction
+                props[s].restitution = self._cfg.terrain.restitution
+            self._friction_values[env_id, :] = self._cfg.terrain.static_friction
+            self._restitution_values[env_id, :] = self._cfg.terrain.restitution
+            return props
+
+        if self._cfg.domain_rand.randomize_friction and not self._is_clean_validation_env(env_id):
             if env_id==0:
                 # prepare friction randomization
                 friction_range = self._cfg.domain_rand.friction_range
@@ -1188,7 +1216,7 @@ class IsaacGymSimulator(Simulator):
                 props[s].friction = self.friction_coeffs[env_id]
             self._friction_values[env_id, :] = self.friction_coeffs[env_id]
 
-        if self._cfg.domain_rand.randomize_restitution:
+        if self._cfg.domain_rand.randomize_restitution and not self._is_clean_validation_env(env_id):
             if env_id == 0:
                 restitution_range = self._cfg.domain_rand.restitution_range
                 num_buckets = 64
@@ -1228,8 +1256,14 @@ class IsaacGymSimulator(Simulator):
                 r = self._dof_pos_limits[i, 1] - self._dof_pos_limits[i, 0]
                 self._dof_pos_limits[i, 0] = m - 0.5 * r * self._cfg.rewards.soft_dof_pos_limit
                 self._dof_pos_limits[i, 1] = m + 0.5 * r * self._cfg.rewards.soft_dof_pos_limit
+
+        if self._is_clean_validation_env(env_id):
+            self._joint_friction[env_id] = 0.0
+            self._joint_damping[env_id] = 0.0
+            self._joint_armature[env_id] = 0.0
+            return props
         
-        if self._cfg.domain_rand.randomize_joint_friction:
+        if self._cfg.domain_rand.randomize_joint_friction and not self._is_clean_validation_env(env_id):
             joint_friction_range = np.array(
                 self._cfg.domain_rand.joint_friction_range, dtype=np.float32)
             friction = np.random.uniform(
@@ -1239,7 +1273,7 @@ class IsaacGymSimulator(Simulator):
                 props["friction"][j] = torch.tensor(
                     friction, dtype=torch.float, device=self._device)
 
-        if self._cfg.domain_rand.randomize_joint_damping:
+        if self._cfg.domain_rand.randomize_joint_damping and not self._is_clean_validation_env(env_id):
             joint_damping_range = np.array(
                 self._cfg.domain_rand.joint_damping_range, dtype=np.float32)
             damping = np.random.uniform(
@@ -1249,7 +1283,7 @@ class IsaacGymSimulator(Simulator):
                 props["damping"][j] = torch.tensor(
                     damping, dtype=torch.float, device=self._device)
 
-        if self._cfg.domain_rand.randomize_joint_armature:
+        if self._cfg.domain_rand.randomize_joint_armature and not self._is_clean_validation_env(env_id):
             joint_armature_range = np.array(
                 self._cfg.domain_rand.joint_armature_range, dtype=np.float32)
             armature = np.random.uniform(
@@ -1279,14 +1313,14 @@ class IsaacGymSimulator(Simulator):
         #         print(f"Mass of body {i}: {p.mass} (before randomization)")
         #     print(f"Total mass {sum} (before randomization)")
         # randomize base mass
-        if self._cfg.domain_rand.randomize_base_mass:
+        if self._cfg.domain_rand.randomize_base_mass and not self._is_clean_validation_env(env_id):
             rng = self._cfg.domain_rand.added_mass_range
             added_base_mass = np.random.uniform(rng[0], rng[1])
             props[0].mass += added_base_mass
             self._added_base_mass[env_id] = added_base_mass
 
         # randomize com position
-        if self._cfg.domain_rand.randomize_com_displacement:
+        if self._cfg.domain_rand.randomize_com_displacement and not self._is_clean_validation_env(env_id):
             com_x_bias = np.random.uniform(
                 self._cfg.domain_rand.com_pos_x_range[0], self._cfg.domain_rand.com_pos_x_range[1])
             com_y_bias = np.random.uniform(
